@@ -1,6 +1,6 @@
 # poprocks
 
-![poprocks logo](docs/assets/logo.png)
+![poprocks logo](docs/assets/poprocks.png)
 
 poprocks is a Go toolkit for orchestrating Firecracker microVM workloads, with utilities for storage, secure networking, communication, and VM lifecycle management.
 
