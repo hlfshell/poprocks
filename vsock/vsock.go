@@ -1,6 +1,7 @@
 package vsock
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -169,16 +170,7 @@ func (m *Messenger) Send(ctx context.Context, msg *Message) error {
 	if m.vsock == nil {
 		return ErrNilTransport
 	}
-
-	// Get binary representation of the message
-	binary := msg.Binary()
-	if m.config.MaxMessageSize > 0 && len(binary) > m.config.MaxMessageSize {
-		return fmt.Errorf("message size too large")
-	}
-
-	m.writeLock.Lock()
-	defer m.writeLock.Unlock()
-	return m.writeAll(ctx, binary)
+	return m.SendStreamWithID(ctx, msg.ID, msg.Type, uint32(len(msg.Payload)), bytes.NewReader(msg.Payload))
 }
 
 func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
@@ -204,25 +196,7 @@ func (m *Messenger) readMessage() (*Message, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	msg := &Message{
-		ID:     header.ID,
-		Type:   header.Type,
-		Length: header.Length,
-	}
-	if msg.Length == 0 {
-		msg.Payload = nil
-		return msg, nil
-	}
-
-	msg.Payload = make([]byte, int(msg.Length))
-	if _, err := io.ReadFull(m.vsock, msg.Payload); err != nil {
-		return nil, err
-	}
-	if err := msg.Validate(); err != nil {
-		return nil, err
-	}
-	return msg, nil
+	return m.readMessagePayload(header)
 }
 
 func (m *Messenger) Serve(ctx context.Context) error {
@@ -260,22 +234,11 @@ func (m *Messenger) Serve(ctx context.Context) error {
 			return err
 		}
 
-		if header.Type == heartbeatTypeID {
-			msg, err := m.readMessagePayload(header)
-			if err != nil {
-				return err
-			}
-			if err := m.handleMessage(ctx, msg); err != nil {
-				return err
-			}
-			continue
-		}
-
+		streamMsg := newStreamMessage(header, m.vsock)
 		m.lock.RLock()
 		streamHandler := m.streamReceivers[header.Type]
 		m.lock.RUnlock()
 		if streamHandler != nil {
-			streamMsg := newStreamMessage(header, m.vsock)
 			err := streamHandler(ctx, streamMsg)
 			drainErr := streamMsg.drain()
 			if err != nil {
@@ -287,7 +250,7 @@ func (m *Messenger) Serve(ctx context.Context) error {
 			continue
 		}
 
-		msg, err := m.readMessagePayload(header)
+		msg, err := materializeStreamMessage(streamMsg)
 		if err != nil {
 			return err
 		}
@@ -301,22 +264,5 @@ func (m *Messenger) readMessagePayload(header *Message) (*Message, error) {
 	if header == nil {
 		return nil, ErrNilMessage
 	}
-	msg := &Message{
-		ID:     header.ID,
-		Type:   header.Type,
-		Length: header.Length,
-	}
-	if msg.Length == 0 {
-		msg.Payload = nil
-		return msg, nil
-	}
-
-	msg.Payload = make([]byte, int(msg.Length))
-	if _, err := io.ReadFull(m.vsock, msg.Payload); err != nil {
-		return nil, err
-	}
-	if err := msg.Validate(); err != nil {
-		return nil, err
-	}
-	return msg, nil
+	return materializeStreamMessage(newStreamMessage(header, m.vsock))
 }

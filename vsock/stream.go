@@ -208,6 +208,31 @@ func (m *Messenger) readHeader() (*Message, error) {
 	return msg, nil
 }
 
+func materializeStreamMessage(streamMsg *StreamMessage) (*Message, error) {
+	if streamMsg == nil || streamMsg.Message == nil {
+		return nil, ErrNilMessage
+	}
+	msg := &Message{
+		ID:     streamMsg.Message.ID,
+		Type:   streamMsg.Message.Type,
+		Length: streamMsg.Message.Length,
+	}
+	if msg.Length == 0 {
+		msg.Payload = nil
+		return msg, nil
+	}
+
+	payload, err := streamMsg.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	msg.Payload = payload
+	if err := msg.Validate(); err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
 func streamSourceFromPayload(payload any) (io.Reader, uint32, io.Closer, error) {
 	if payload == nil {
 		return nil, 0, nil, fmt.Errorf("payload is required")
