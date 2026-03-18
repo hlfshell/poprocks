@@ -11,12 +11,11 @@ import (
 )
 
 type M[T any] struct {
-	lock             sync.RWMutex
-	codec            *Codec[T]
-	receivers        []func(T) error
-	streamReceivers  []func(context.Context, *StreamMessage) error
-	streamRegistered bool
-	messenger        *Messenger
+	lock            sync.RWMutex
+	codec           *Codec[T]
+	receivers       []func(T) error
+	streamReceivers []func(context.Context, *Message) error
+	messenger       *Messenger
 }
 
 func NewM[T any](messenger *Messenger, codec *Codec[T]) (*M[T], error) {
@@ -64,21 +63,42 @@ func NewM[T any](messenger *Messenger, codec *Codec[T]) (*M[T], error) {
 	}
 
 	m := &M[T]{
-		lock:             sync.RWMutex{},
-		codec:            codec,
-		receivers:        make([]func(T) error, 0),
-		streamReceivers:  make([]func(context.Context, *StreamMessage) error, 0),
-		streamRegistered: false,
-		messenger:        messenger,
+		lock:            sync.RWMutex{},
+		codec:           codec,
+		receivers:       make([]func(T) error, 0),
+		streamReceivers: make([]func(context.Context, *Message) error, 0),
+		messenger:       messenger,
 	}
 
-	messenger.receivers[codec.typeID] = func(ctx context.Context, msg *Message) error {
+	messenger.receivers[codec.typeID] = func(ctx context.Context, streamMsg *Message) error {
+		m.lock.RLock()
+		streamReceivers := append([]func(context.Context, *Message) error(nil), m.streamReceivers...)
+		typedReceivers := append([]func(T) error(nil), m.receivers...)
+		m.lock.RUnlock()
+
+		if len(streamReceivers) > 0 {
+			for _, receiver := range streamReceivers {
+				if err := receiver(ctx, streamMsg); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+
+		msg, err := materializeStreamMessage(streamMsg)
+		if err != nil {
+			return err
+		}
+		payload, err := msg.ReadAll()
+		if err != nil {
+			return err
+		}
+
 		var (
 			t   T
-			err error
 		)
 		if m.codec.Stream {
-			t, err = decodeStreamPayload[T](msg.Payload)
+			t, err = decodeStreamPayload[T](payload)
 		} else {
 			// Convert msg to T
 			t, err = m.codec.Decode(msg)
@@ -87,10 +107,7 @@ func NewM[T any](messenger *Messenger, codec *Codec[T]) (*M[T], error) {
 			return err
 		}
 
-		m.lock.RLock()
-		defer m.lock.RUnlock()
-
-		for _, receiver := range m.receivers {
+		for _, receiver := range typedReceivers {
 			go func() { receiver(t) }()
 		}
 
@@ -136,7 +153,7 @@ func (m *M[T]) OnReceive(handler func(T) error) {
 	m.receivers = append(m.receivers, handler)
 }
 
-func (m *M[T]) OnReceiveStream(handler func(context.Context, *StreamMessage) error) error {
+func (m *M[T]) OnReceiveStream(handler func(context.Context, *Message) error) error {
 	if m == nil {
 		return ErrNilHandler
 	}
@@ -145,36 +162,8 @@ func (m *M[T]) OnReceiveStream(handler func(context.Context, *StreamMessage) err
 	}
 
 	m.lock.Lock()
+	defer m.lock.Unlock()
 	m.streamReceivers = append(m.streamReceivers, handler)
-	shouldRegister := !m.streamRegistered
-	m.lock.Unlock()
-
-	if !shouldRegister {
-		return nil
-	}
-
-	if err := m.messenger.OnStream(m.codec.typeID, func(ctx context.Context, msg *StreamMessage) error {
-		m.lock.RLock()
-		handlers := append([]func(context.Context, *StreamMessage) error(nil), m.streamReceivers...)
-		m.lock.RUnlock()
-		for _, receiver := range handlers {
-			if err := receiver(ctx, msg); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		m.lock.Lock()
-		if len(m.streamReceivers) > 0 {
-			m.streamReceivers = m.streamReceivers[:len(m.streamReceivers)-1]
-		}
-		m.lock.Unlock()
-		return err
-	}
-
-	m.lock.Lock()
-	m.streamRegistered = true
-	m.lock.Unlock()
 	return nil
 }
 

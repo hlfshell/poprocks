@@ -30,7 +30,7 @@ func TestMessengerSendStreamBidirectional(t *testing.T) {
 	hostReceived := make(chan []byte, 1)
 	clientReceived := make(chan []byte, 1)
 
-	if err := host.OnStream(9201, func(ctx context.Context, msg *StreamMessage) error {
+	if err := host.OnReceive(9201, func(ctx context.Context, msg *Message) error {
 		_ = ctx
 		b, err := msg.ReadAll()
 		if err != nil {
@@ -42,7 +42,7 @@ func TestMessengerSendStreamBidirectional(t *testing.T) {
 		t.Fatalf("register host stream handler: %v", err)
 	}
 
-	if err := client.OnStream(9201, func(ctx context.Context, msg *StreamMessage) error {
+	if err := client.OnReceive(9201, func(ctx context.Context, msg *Message) error {
 		_ = ctx
 		b, err := msg.ReadAll()
 		if err != nil {
@@ -117,7 +117,7 @@ func TestMAutoStreamCodecDetectsReaderPayload(t *testing.T) {
 
 	payload := bytes.Repeat([]byte("z"), 2*1024*1024+123)
 	got := make(chan []byte, 1)
-	if err := receiver.OnStream(codec.TypeID(), func(ctx context.Context, msg *StreamMessage) error {
+	if err := receiver.OnReceive(codec.TypeID(), func(ctx context.Context, msg *Message) error {
 		_ = ctx
 		b, err := msg.ReadAll()
 		if err != nil {
@@ -198,7 +198,7 @@ func TestMessengerStreamWriteToDisk(t *testing.T) {
 	defer outFile.Close()
 
 	done := make(chan error, 1)
-	if err := receiver.OnStream(9301, func(ctx context.Context, msg *StreamMessage) error {
+	if err := receiver.OnReceive(9301, func(ctx context.Context, msg *Message) error {
 		_ = ctx
 		if _, err := outFile.Seek(0, io.SeekStart); err != nil {
 			return err

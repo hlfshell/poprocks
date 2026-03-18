@@ -34,21 +34,22 @@ type dualTaggedPayload struct {
 
 func TestMessageValidate(t *testing.T) {
 	t.Run("valid message", func(t *testing.T) {
-		msg := &Message{ID: 1, Type: 3, Length: 2, Payload: []byte{1, 2}}
+		msg := NewMessage(1, 3, []byte{1, 2})
 		if err := msg.Validate(); err != nil {
 			t.Fatalf("Validate() unexpected error: %v", err)
 		}
 	})
 
 	t.Run("zero ID", func(t *testing.T) {
-		msg := &Message{ID: 0, Type: 1, Length: 0, Payload: nil}
+		msg := NewMessage(0, 1, nil)
 		if err := msg.Validate(); err == nil {
 			t.Fatal("Validate() expected error for zero ID")
 		}
 	})
 
 	t.Run("length mismatch", func(t *testing.T) {
-		msg := &Message{ID: 1, Type: 1, Length: 5, Payload: []byte{1, 2}}
+		msg := NewMessage(1, 1, []byte{1, 2})
+		msg.Length = 5
 		if err := msg.Validate(); err == nil {
 			t.Fatal("Validate() expected payload length mismatch error")
 		}
@@ -56,12 +57,8 @@ func TestMessageValidate(t *testing.T) {
 }
 
 func TestMessageBinaryAndParseRoundTrip(t *testing.T) {
-	original := &Message{
-		ID:      42,
-		Type:    7,
-		Length:  999, // Binary() should ignore stale Length and compute from payload.
-		Payload: []byte("hello"),
-	}
+	original := NewMessage(42, 7, []byte("hello"))
+	original.Length = 999 // Binary() should ignore stale Length and compute from payload.
 
 	raw := original.Binary()
 	parsed, err := ParseBinary(raw)
@@ -75,11 +72,19 @@ func TestMessageBinaryAndParseRoundTrip(t *testing.T) {
 	if parsed.Type != original.Type {
 		t.Fatalf("Type mismatch: got=%d want=%d", parsed.Type, original.Type)
 	}
-	if got, want := parsed.Length, uint32(len(original.Payload)); got != want {
+	originalPayload, err := original.ReadAll()
+	if err != nil {
+		t.Fatalf("read original payload: %v", err)
+	}
+	if got, want := parsed.Length, uint32(len(originalPayload)); got != want {
 		t.Fatalf("Length mismatch: got=%d want=%d", got, want)
 	}
-	if string(parsed.Payload) != string(original.Payload) {
-		t.Fatalf("Payload mismatch: got=%q want=%q", parsed.Payload, original.Payload)
+	parsedPayload, err := parsed.ReadAll()
+	if err != nil {
+		t.Fatalf("read parsed payload: %v", err)
+	}
+	if string(parsedPayload) != string(originalPayload) {
+		t.Fatalf("Payload mismatch: got=%q want=%q", parsedPayload, originalPayload)
 	}
 }
 
@@ -163,7 +168,11 @@ func TestCodecRoundTripMsgpack(t *testing.T) {
 	if got, want := msg.Type, uint32(9); got != want {
 		t.Fatalf("Type mismatch: got=%d want=%d", got, want)
 	}
-	if got, want := msg.Length, uint32(len(msg.Payload)); got != want {
+	payload, err := msg.ReadAll()
+	if err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	if got, want := msg.Length, uint32(len(payload)); got != want {
 		t.Fatalf("Length mismatch: got=%d want=%d", got, want)
 	}
 
@@ -252,7 +261,7 @@ func TestCodecDecodeErrors(t *testing.T) {
 	})
 
 	t.Run("type mismatch", func(t *testing.T) {
-		msg := &Message{ID: 1, Type: 99, Length: 0, Payload: nil}
+		msg := NewMessage(1, 99, nil)
 		if _, err := codec.Decode(msg); err == nil {
 			t.Fatal("Decode() expected type mismatch error")
 		}

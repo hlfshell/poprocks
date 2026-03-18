@@ -350,9 +350,13 @@ func TestHeartbeatClientHostMessageFlow(t *testing.T) {
 	}
 	go func() { _ = client.handleHeartbeatMessage(context.Background(), reqMsg) }()
 	resp := readOneMessageFromConn(t, hostConn)
+	respPayload, err := resp.ReadAll()
+	if err != nil {
+		t.Fatalf("read heartbeat payload: %v", err)
+	}
 
 	var rp heartbeatPayload
-	if err := msgpack.Unmarshal(resp.Payload, &rp); err != nil {
+	if err := msgpack.Unmarshal(respPayload, &rp); err != nil {
 		t.Fatalf("unmarshal heartbeat response: %v", err)
 	}
 	if rp.Status != HeartbeatStatusOK {

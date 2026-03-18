@@ -1,6 +1,7 @@
 package vsock
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -8,14 +9,6 @@ import (
 	"fmt"
 	"io"
 )
-
-// StreamMessage exposes a message payload as a forward-only stream.
-// Callers can either materialize payload bytes in memory or stream directly
-// into an io.Writer (for example, an on-disk file).
-type StreamMessage struct {
-	Message *Message
-	reader  *io.LimitedReader
-}
 
 type StreamSource interface {
 	StreamSource() (io.Reader, uint32, error)
@@ -33,49 +26,77 @@ func (p ReaderPayload) StreamSource() (io.Reader, uint32, error) {
 	return p.Reader, p.Length, nil
 }
 
-func newStreamMessage(msg *Message, r io.Reader) *StreamMessage {
-	return &StreamMessage{
-		Message: msg,
-		reader: &io.LimitedReader{
-			R: r,
-			N: int64(msg.Length),
-		},
-	}
-}
-
-func (s *StreamMessage) Header() *Message {
-	return s.Message
-}
-
-func (s *StreamMessage) Reader() io.Reader {
-	if s == nil || s.reader == nil {
+func newMessageFromHeader(msg *Message, r io.Reader) *Message {
+	if msg == nil {
 		return nil
 	}
-	return s.reader
+	limited := &io.LimitedReader{
+		R: r,
+		N: int64(msg.Length),
+	}
+	msg.payloadReader = limited
+	msg.Payload = limited
+	return msg
 }
 
-func (s *StreamMessage) ReadAll() ([]byte, error) {
-	if s == nil || s.reader == nil {
+func (m *Message) Reader() io.Reader {
+	if m == nil || m.payloadReader == nil {
+		return nil
+	}
+	return m.payloadReader
+}
+
+func (m *Message) ReadAll() ([]byte, error) {
+	if m == nil {
 		return nil, ErrNilMessage
 	}
-	return io.ReadAll(s.reader)
+	if m.payloadCache != nil {
+		out := append([]byte(nil), m.payloadCache...)
+		return out, nil
+	}
+	if m.payloadReader == nil {
+		if m.Length == 0 {
+			return nil, nil
+		}
+		return nil, ErrNilMessage
+	}
+	payload, err := io.ReadAll(m.payloadReader)
+	if err != nil {
+		return nil, err
+	}
+	m.payloadCache = payload
+	cachedReader := bytes.NewReader(m.payloadCache)
+	limited := &io.LimitedReader{R: cachedReader, N: int64(len(m.payloadCache))}
+	m.payloadReader = limited
+	m.Payload = limited
+	return append([]byte(nil), payload...), nil
 }
 
-func (s *StreamMessage) WriteTo(w io.Writer) (int64, error) {
-	if s == nil || s.reader == nil {
+func (m *Message) WriteTo(w io.Writer) (int64, error) {
+	if m == nil {
 		return 0, ErrNilMessage
 	}
 	if w == nil {
 		return 0, fmt.Errorf("writer is required")
 	}
-	return io.Copy(w, s.reader)
+	if m.payloadCache != nil {
+		r := bytes.NewReader(m.payloadCache)
+		return io.Copy(w, r)
+	}
+	if m.payloadReader == nil {
+		if m.Length == 0 {
+			return 0, nil
+		}
+		return 0, ErrNilMessage
+	}
+	return io.Copy(w, m.payloadReader)
 }
 
-func (s *StreamMessage) drain() error {
-	if s == nil || s.reader == nil || s.reader.N == 0 {
+func (m *Message) drain() error {
+	if m == nil || m.payloadReader == nil || m.payloadReader.N == 0 {
 		return nil
 	}
-	_, err := io.Copy(io.Discard, s.reader)
+	_, err := io.Copy(io.Discard, m.payloadReader)
 	return err
 }
 
@@ -195,9 +216,11 @@ func (m *Messenger) readHeader() (*Message, error) {
 	}
 
 	msg := &Message{
-		ID:     binary.BigEndian.Uint64(header[0:8]),
-		Type:   binary.BigEndian.Uint32(header[8:12]),
-		Length: binary.BigEndian.Uint32(header[12:16]),
+		Header: Header{
+			ID:     binary.BigEndian.Uint64(header[0:8]),
+			Type:   binary.BigEndian.Uint32(header[8:12]),
+			Length: binary.BigEndian.Uint32(header[12:16]),
+		},
 	}
 	if msg.ID == 0 {
 		return nil, fmt.Errorf("id is required")
@@ -208,29 +231,20 @@ func (m *Messenger) readHeader() (*Message, error) {
 	return msg, nil
 }
 
-func materializeStreamMessage(streamMsg *StreamMessage) (*Message, error) {
-	if streamMsg == nil || streamMsg.Message == nil {
+func materializeStreamMessage(msg *Message) (*Message, error) {
+	if msg == nil {
 		return nil, ErrNilMessage
 	}
-	msg := &Message{
-		ID:     streamMsg.Message.ID,
-		Type:   streamMsg.Message.Type,
-		Length: streamMsg.Message.Length,
-	}
-	if msg.Length == 0 {
-		msg.Payload = nil
-		return msg, nil
-	}
-
-	payload, err := streamMsg.ReadAll()
+	payload, err := msg.ReadAll()
 	if err != nil {
 		return nil, err
 	}
-	msg.Payload = payload
-	if err := msg.Validate(); err != nil {
+	out := NewMessage(msg.ID, msg.Type, payload)
+	out.Length = msg.Length
+	if err := out.Validate(); err != nil {
 		return nil, err
 	}
-	return msg, nil
+	return out, nil
 }
 
 func streamSourceFromPayload(payload any) (io.Reader, uint32, io.Closer, error) {

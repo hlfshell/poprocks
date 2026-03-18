@@ -21,7 +21,6 @@ type Messenger struct {
 	config MessengerConfig
 
 	receivers              map[uint32]func(context.Context, *Message) error
-	streamReceivers        map[uint32]func(context.Context, *StreamMessage) error
 	unknownMessageReceiver func(context.Context, *Message) error
 
 	heartbeat        Heartbeat
@@ -124,7 +123,6 @@ func NewMessenger(connection net.Conn) *Messenger {
 	return &Messenger{
 		config:                 cfg,
 		receivers:              make(map[uint32]func(context.Context, *Message) error),
-		streamReceivers:        make(map[uint32]func(context.Context, *StreamMessage) error),
 		vsock:                  connection,
 		unknownMessageReceiver: onUnknown,
 	}
@@ -140,7 +138,7 @@ func (m *Messenger) OnUnknown(receiver func(context.Context, *Message) error) er
 	return nil
 }
 
-func (m *Messenger) OnStream(msgType uint32, receiver func(context.Context, *StreamMessage) error) error {
+func (m *Messenger) OnReceive(msgType uint32, receiver func(context.Context, *Message) error) error {
 	if receiver == nil {
 		return ErrNilHandler
 	}
@@ -150,10 +148,10 @@ func (m *Messenger) OnStream(msgType uint32, receiver func(context.Context, *Str
 
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	if _, exists := m.streamReceivers[msgType]; exists {
+	if _, exists := m.receivers[msgType]; exists {
 		return ErrHandlerAlreadyRegistered
 	}
-	m.streamReceivers[msgType] = receiver
+	m.receivers[msgType] = receiver
 	return nil
 }
 
@@ -170,7 +168,11 @@ func (m *Messenger) Send(ctx context.Context, msg *Message) error {
 	if m.vsock == nil {
 		return ErrNilTransport
 	}
-	return m.SendStreamWithID(ctx, msg.ID, msg.Type, uint32(len(msg.Payload)), bytes.NewReader(msg.Payload))
+	payload, err := msg.ReadAll()
+	if err != nil {
+		return err
+	}
+	return m.SendStreamWithID(ctx, msg.ID, msg.Type, uint32(len(payload)), bytes.NewReader(payload))
 }
 
 func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
@@ -178,7 +180,11 @@ func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
 		return ErrNilMessage
 	}
 	if msg.Type == heartbeatTypeID {
-		return m.handleHeartbeatMessage(ctx, msg)
+		inMemory, err := materializeStreamMessage(msg)
+		if err != nil {
+			return err
+		}
+		return m.handleHeartbeatMessage(ctx, inMemory)
 	}
 
 	m.lock.RLock()
@@ -234,28 +240,14 @@ func (m *Messenger) Serve(ctx context.Context) error {
 			return err
 		}
 
-		streamMsg := newStreamMessage(header, m.vsock)
-		m.lock.RLock()
-		streamHandler := m.streamReceivers[header.Type]
-		m.lock.RUnlock()
-		if streamHandler != nil {
-			err := streamHandler(ctx, streamMsg)
-			drainErr := streamMsg.drain()
-			if err != nil {
-				return err
-			}
-			if drainErr != nil {
-				return drainErr
-			}
-			continue
-		}
-
-		msg, err := materializeStreamMessage(streamMsg)
+		streamMsg := newMessageFromHeader(header, m.vsock)
+		err = m.handleMessage(ctx, streamMsg)
+		drainErr := streamMsg.drain()
 		if err != nil {
 			return err
 		}
-		if err := m.handleMessage(ctx, msg); err != nil {
-			return err
+		if drainErr != nil {
+			return drainErr
 		}
 	}
 }
@@ -264,5 +256,5 @@ func (m *Messenger) readMessagePayload(header *Message) (*Message, error) {
 	if header == nil {
 		return nil, ErrNilMessage
 	}
-	return materializeStreamMessage(newStreamMessage(header, m.vsock))
+	return materializeStreamMessage(newMessageFromHeader(header, m.vsock))
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 
 	"github.com/vmihailenco/msgpack/v5"
@@ -23,10 +24,17 @@ import (
 // The ID is for ACK, error handling, timing, etc Type can be ignored (null'ed)
 // if not needed. Per application assignment of the types.
 type Message struct {
-	ID      uint64 `json:"id"`
-	Type    uint32 `json:"type"`
-	Length  uint32 `json:"length"`
-	Payload []byte `json:"payload"`
+	Header
+	Payload io.Reader `json:"-"`
+
+	payloadReader *io.LimitedReader
+	payloadCache  []byte
+}
+
+type Header struct {
+	ID     uint64 `json:"id"`
+	Type   uint32 `json:"type"`
+	Length uint32 `json:"length"`
 }
 
 const headerLength = 16 // 8-byte ID + 4-byte Type + 4-byte Length
@@ -35,31 +43,43 @@ func (m *Message) Validate() error {
 	if m.ID == 0 {
 		return errors.New("id is required")
 	}
-	if len(m.Payload) != int(m.Length) {
+	if m.payloadCache != nil && len(m.payloadCache) != int(m.Length) {
 		return errors.New("payload length mismatch")
 	}
 	return nil
 }
 
 func (m *Message) Binary() []byte {
-	payloadLen := uint32(len(m.Payload))
-	raw := make([]byte, headerLength+len(m.Payload))
+	payload, err := m.ReadAll()
+	if err != nil {
+		return nil
+	}
+	payloadLen := uint32(len(payload))
+	raw := make([]byte, headerLength+len(payload))
 
 	binary.BigEndian.PutUint64(raw[0:8], m.ID)
 	binary.BigEndian.PutUint32(raw[8:12], m.Type)
 	binary.BigEndian.PutUint32(raw[12:16], payloadLen)
-	copy(raw[headerLength:], m.Payload)
+	copy(raw[headerLength:], payload)
 
 	return raw
 }
 
 func NewMessage(id uint64, msgType uint32, payload []byte) *Message {
-	return &Message{
-		ID:      id,
-		Type:    msgType,
-		Length:  uint32(len(payload)),
-		Payload: payload,
+	copied := append([]byte(nil), payload...)
+	msg := &Message{
+		Header: Header{
+			ID:     id,
+			Type:   msgType,
+			Length: uint32(len(copied)),
+		},
+		payloadCache: copied,
 	}
+	reader := bytes.NewReader(copied)
+	limited := &io.LimitedReader{R: reader, N: int64(len(copied))}
+	msg.payloadReader = limited
+	msg.Payload = limited
+	return msg
 }
 
 func ParseBinary(raw []byte) (*Message, error) {
@@ -79,12 +99,8 @@ func ParseBinary(raw []byte) (*Message, error) {
 	payload := make([]byte, payloadLen)
 	copy(payload, raw[headerLength:])
 
-	msg := &Message{
-		ID:      id,
-		Type:    msgType,
-		Length:  length,
-		Payload: payload,
-	}
+	msg := NewMessage(id, msgType, payload)
+	msg.Length = length
 	if err := msg.Validate(); err != nil {
 		return nil, err
 	}
@@ -165,8 +181,12 @@ func (c *Codec[T]) Decode(msg *Message) (T, error) {
 	if msg.Type != c.typeID {
 		return t, fmt.Errorf("message type mismatch: got=%d want=%d", msg.Type, c.typeID)
 	}
+	payload, err := msg.ReadAll()
+	if err != nil {
+		return t, err
+	}
 
-	if err := decodeWith(c.codec, msg.Payload, &t); err != nil {
+	if err := decodeWith(c.codec, payload, &t); err != nil {
 		return t, err
 	}
 	return t, nil

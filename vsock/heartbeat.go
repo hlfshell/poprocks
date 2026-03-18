@@ -116,8 +116,12 @@ func (m *Messenger) heartbeatPing(ctx context.Context) (<-chan struct{}, error) 
 }
 
 func (m *Messenger) handleHeartbeatMessage(ctx context.Context, msg *Message) error {
+	raw, err := msg.ReadAll()
+	if err != nil {
+		return err
+	}
 	var p heartbeatPayload
-	if err := msgpack.Unmarshal(msg.Payload, &p); err != nil {
+	if err := msgpack.Unmarshal(raw, &p); err != nil {
 		return err
 	}
 
