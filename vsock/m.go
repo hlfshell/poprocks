@@ -95,7 +95,7 @@ func NewM[T any](messenger *Messenger, codec *Codec[T]) (*M[T], error) {
 		}
 
 		var (
-			t   T
+			t T
 		)
 		if m.codec.Stream {
 			t, err = decodeStreamPayload[T](payload)
