@@ -18,3 +18,5 @@ This is a bunch of suggested things I want to add to poprocks
     - job queueing
 6. Env variables / secrets management for VMs
 7. Wrapper VM + build system for non Linux OSes
+8. Overlay images for rollback of volumes / VMs
+9. Snapshotting of VMs
