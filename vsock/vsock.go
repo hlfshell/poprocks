@@ -18,12 +18,14 @@ type Messenger struct {
 	writeLock sync.Mutex
 	hbLock    sync.Mutex
 	ackLock   sync.Mutex
+	respLock  sync.Mutex
 
 	config MessengerConfig
 
 	receivers              map[uint32]func(context.Context, *Message) error
 	unknownMessageReceiver func(context.Context, *Message) error
 	pendingAcks            map[uint64]chan struct{}
+	pendingResponses       map[uint64]pendingResponse
 
 	heartbeat        Heartbeat
 	heartbeatPending chan struct{}
@@ -139,6 +141,7 @@ func newMessenger(connection net.Conn, cfg MessengerConfig) *Messenger {
 		config:                 cfg,
 		receivers:              make(map[uint32]func(context.Context, *Message) error),
 		pendingAcks:            make(map[uint64]chan struct{}),
+		pendingResponses:       make(map[uint64]pendingResponse),
 		vsock:                  connection,
 		unknownMessageReceiver: onUnknown,
 	}
@@ -194,6 +197,11 @@ func (m *Messenger) Send(ctx context.Context, msg *Message) error {
 func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return ErrNilMessage
+	}
+	if resolved, err := m.resolveResponse(msg); err != nil {
+		return err
+	} else if resolved {
+		return m.sendAcknowledge(ctx, msg)
 	}
 	if msg.Type == acknowledgeTypeID {
 		m.resolveAck(msg.ID)
@@ -315,4 +323,47 @@ func (m *Messenger) resolveAck(id uint64) {
 	if ok {
 		close(ch)
 	}
+}
+
+type pendingResponse struct {
+	msgType uint32
+	ch      chan *Message
+}
+
+func (m *Messenger) registerPendingResponse(id uint64, msgType uint32) chan *Message {
+	ch := make(chan *Message, 1)
+	m.respLock.Lock()
+	m.pendingResponses[id] = pendingResponse{msgType: msgType, ch: ch}
+	m.respLock.Unlock()
+	return ch
+}
+
+func (m *Messenger) unregisterPendingResponse(id uint64, ch chan *Message) {
+	m.respLock.Lock()
+	if current, ok := m.pendingResponses[id]; ok && current.ch == ch {
+		delete(m.pendingResponses, id)
+	}
+	m.respLock.Unlock()
+}
+
+func (m *Messenger) resolveResponse(msg *Message) (bool, error) {
+	if m == nil || msg == nil {
+		return false, nil
+	}
+	m.respLock.Lock()
+	pending, ok := m.pendingResponses[msg.ID]
+	if ok && pending.msgType == msg.Type {
+		delete(m.pendingResponses, msg.ID)
+	}
+	m.respLock.Unlock()
+	if !ok || pending.msgType != msg.Type {
+		return false, nil
+	}
+	inMemory, err := materializeStreamMessage(msg)
+	if err != nil {
+		return false, err
+	}
+	pending.ch <- inMemory
+	close(pending.ch)
+	return true, nil
 }

@@ -18,6 +18,14 @@ type mJSONPayload struct {
 	Name string `json:"name"`
 }
 
+type requestPayload struct {
+	Name string `json:"name"`
+}
+
+type responsePayload struct {
+	Reply string `json:"reply"`
+}
+
 func readOneMessage(conn net.Conn) (*Message, error) {
 	header := make([]byte, headerLength)
 	if _, err := io.ReadFull(conn, header); err != nil {
@@ -538,6 +546,140 @@ func TestMessengerServiceEndToEndBidirectional(t *testing.T) {
 	}
 	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("client serve error: %v", err)
+	}
+}
+
+func TestRequestResponseEndToEnd(t *testing.T) {
+	hostConn, clientConn := net.Pipe()
+	defer hostConn.Close()
+	defer clientConn.Close()
+
+	host := NewMessenger(hostConn)
+	client := NewMessenger(clientConn)
+
+	reqCodec, err := NewCodecOfType[requestPayload](1201, CodecJSON)
+	if err != nil {
+		t.Fatalf("request codec: %v", err)
+	}
+	respCodec, err := NewCodecOfType[responsePayload](1202, CodecJSON)
+	if err != nil {
+		t.Fatalf("response codec: %v", err)
+	}
+
+	server, err := NewR[requestPayload, responsePayload](host, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new server request wrapper: %v", err)
+	}
+	clientReq, err := NewR[requestPayload, responsePayload](client, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new client request wrapper: %v", err)
+	}
+
+	server.OnRequest(func(ctx context.Context, req requestPayload) (responsePayload, error) {
+		_ = ctx
+		return responsePayload{Reply: "hello " + req.Name}, nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hostErr := make(chan error, 1)
+	clientErr := make(chan error, 1)
+	go func() { hostErr <- host.Serve(ctx) }()
+	go func() { clientErr <- client.Serve(ctx) }()
+
+	resp, err := clientReq.Request(ctx, requestPayload{Name: "vm"})
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	if resp.Reply != "hello vm" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+
+	cancel()
+	if err := <-hostErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("host serve error: %v", err)
+	}
+	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("client serve error: %v", err)
+	}
+}
+
+func TestRequestResponseTimeout(t *testing.T) {
+	senderConn, receiverConn := net.Pipe()
+	defer senderConn.Close()
+	defer receiverConn.Close()
+
+	client := NewMessenger(senderConn)
+	reqCodec, err := NewCodecOfType[requestPayload](1301, CodecJSON)
+	if err != nil {
+		t.Fatalf("request codec: %v", err)
+	}
+	respCodec, err := NewCodecOfType[responsePayload](1302, CodecJSON)
+	if err != nil {
+		t.Fatalf("response codec: %v", err)
+	}
+
+	clientReq, err := NewR[requestPayload, responsePayload](client, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new request wrapper: %v", err)
+	}
+
+	drained := make(chan error, 1)
+	go func() {
+		_, err := readOneMessage(receiverConn)
+		drained <- err
+	}()
+
+	serveCtx, serveCancel := context.WithCancel(context.Background())
+	defer serveCancel()
+	clientErr := make(chan error, 1)
+	go func() { clientErr <- client.Serve(serveCtx) }()
+
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer reqCancel()
+	_, err = clientReq.Request(reqCtx, requestPayload{Name: "timeout"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	if err := <-drained; err != nil {
+		t.Fatalf("peer drain error: %v", err)
+	}
+
+	serveCancel()
+	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("client serve error: %v", err)
+	}
+}
+
+func TestNewRRejectsNilAndDuplicate(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	m := NewMessenger(c1)
+	reqCodec, err := NewCodecOfType[requestPayload](1401, CodecJSON)
+	if err != nil {
+		t.Fatalf("request codec: %v", err)
+	}
+	respCodec, err := NewCodecOfType[responsePayload](1402, CodecJSON)
+	if err != nil {
+		t.Fatalf("response codec: %v", err)
+	}
+
+	if _, err := NewR[requestPayload, responsePayload](nil, reqCodec, respCodec); !errors.Is(err, ErrNilTransport) {
+		t.Fatalf("expected ErrNilTransport, got %v", err)
+	}
+	if _, err := NewR[requestPayload, responsePayload](m, nil, respCodec); !errors.Is(err, ErrNilCodec) {
+		t.Fatalf("expected ErrNilCodec for nil request codec, got %v", err)
+	}
+	if _, err := NewR[requestPayload, responsePayload](m, reqCodec, nil); !errors.Is(err, ErrNilCodec) {
+		t.Fatalf("expected ErrNilCodec for nil response codec, got %v", err)
+	}
+	if _, err := NewR[requestPayload, responsePayload](m, reqCodec, respCodec); err != nil {
+		t.Fatalf("first NewR failed: %v", err)
+	}
+	if _, err := NewR[requestPayload, responsePayload](m, reqCodec, respCodec); err == nil {
+		t.Fatal("expected duplicate request type registration error")
 	}
 }
 

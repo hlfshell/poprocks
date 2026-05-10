@@ -193,11 +193,15 @@ func (c *Codec[T]) Decode(msg *Message) (T, error) {
 }
 
 func (c *Codec[T]) ToMessage(value T) (*Message, error) {
-	payload, err := c.Encode(value)
+	id, err := c.generateID()
 	if err != nil {
 		return nil, err
 	}
-	id, err := c.generateID()
+	return c.ToMessageWithID(id, value)
+}
+
+func (c *Codec[T]) ToMessageWithID(id uint64, value T) (*Message, error) {
+	payload, err := c.Encode(value)
 	if err != nil {
 		return nil, err
 	}
