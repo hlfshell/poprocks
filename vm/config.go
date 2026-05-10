@@ -17,10 +17,24 @@ type Config struct {
 	// state, then we grant it more time, up to the MaxStartupTimeout.
 	StartupTimeout    time.Duration
 	MaxStartupTimeout time.Duration
+
+	// EnvironmentVariables is the environment variables for the VM.
+	EnvironmentVariables *EnvironmentVariables
+}
+
+// Init initializes the runtime config and underlying Firecracker config.
+func (c *Config) Init() error {
+	if c.EnvironmentVariables == nil {
+		c.EnvironmentVariables = NewEnvironmentVariables()
+	}
+	return c.Firecracker.Init()
 }
 
 // Validate validates the entire configuration.
 func (c *Config) Validate() error {
+	if c.EnvironmentVariables == nil {
+		c.EnvironmentVariables = NewEnvironmentVariables()
+	}
 	if err := c.Firecracker.Validate(); err != nil {
 		return err
 	}
