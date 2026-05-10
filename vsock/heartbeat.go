@@ -26,6 +26,7 @@ const (
 )
 
 const heartbeatTypeID uint32 = 0xFFFFFFFE
+const acknowledgeTypeID uint32 = 0xFFFFFFFF
 
 type heartbeatPayload struct {
 	SentAt time.Time      `msgpack:"sent_at"`
@@ -152,6 +153,17 @@ func (m *Messenger) handleHeartbeatMessage(ctx context.Context, msg *Message) er
 	return nil
 }
 
+func (m *Messenger) sendAcknowledge(ctx context.Context, msg *Message) error {
+	if m == nil || msg == nil || msg.Type == acknowledgeTypeID || msg.Type == heartbeatTypeID {
+		return nil
+	}
+	ack := NewMessage(msg.ID, acknowledgeTypeID, nil)
+	go func() {
+		_ = m.Send(ctx, ack)
+	}()
+	return nil
+}
+
 func (m *Messenger) setHeartbeatStatus(status uint8) {
 	m.hbLock.Lock()
 	m.heartbeat.Status = status
@@ -193,12 +205,13 @@ func (m *Messenger) newHeartbeatMessage(payload heartbeatPayload) (*Message, err
 
 func (m *Messenger) snapshotHealth() map[string]any {
 	m.hbLock.Lock()
-	defer m.hbLock.Unlock()
+	provider := m.heartbeatHealth
+	m.hbLock.Unlock()
 
-	if m.heartbeatHealth == nil {
+	if provider == nil {
 		return nil
 	}
-	return m.heartbeatHealth()
+	return provider()
 }
 
 func (m *Messenger) HeartbeatState() Heartbeat {

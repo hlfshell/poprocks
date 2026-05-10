@@ -17,11 +17,13 @@ type Messenger struct {
 	lock      sync.RWMutex
 	writeLock sync.Mutex
 	hbLock    sync.Mutex
+	ackLock   sync.Mutex
 
 	config MessengerConfig
 
 	receivers              map[uint32]func(context.Context, *Message) error
 	unknownMessageReceiver func(context.Context, *Message) error
+	pendingAcks            map[uint64]chan struct{}
 
 	heartbeat        Heartbeat
 	heartbeatPending chan struct{}
@@ -70,6 +72,20 @@ const (
 	AbsoluteMaxMessageSize   = 64 * 1024 * 1024
 )
 
+func DefaultMessengerConfig() MessengerConfig {
+	return MessengerConfig{
+		RequireAcknowledge:     false,
+		Timeout:                DefaultTimeout,
+		MaxRetries:             DefaultMaxRetries,
+		MaxMessageSize:         DefaultMaxMessageSize,
+		MaxMessageSizeReceived: DefaultMaxMessageSize,
+		Heartbeat:              DefaultHearatbeat,
+		HeartbeatHost:          DefaultHeartbeatHost,
+		HeartbeatInterval:      DefaultHeartbeatInterval,
+		HeartbeatTimeout:       DefaultHeartbeatTimeout,
+	}
+}
+
 func (c *MessengerConfig) Validate() error {
 	if c == nil {
 		return nil
@@ -103,18 +119,17 @@ func (c *MessengerConfig) Validate() error {
 }
 
 func NewMessenger(connection net.Conn) *Messenger {
-	cfg := MessengerConfig{
-		RequireAcknowledge:     false,
-		Timeout:                DefaultTimeout,
-		MaxRetries:             DefaultMaxRetries,
-		MaxMessageSize:         DefaultMaxMessageSize,
-		MaxMessageSizeReceived: DefaultMaxMessageSize,
-		Heartbeat:              DefaultHearatbeat,
-		HeartbeatHost:          DefaultHeartbeatHost,
-		HeartbeatInterval:      DefaultHeartbeatInterval,
-		HeartbeatTimeout:       DefaultHeartbeatTimeout,
-	}
+	return newMessenger(connection, DefaultMessengerConfig())
+}
 
+func NewMessengerWithConfig(connection net.Conn, cfg MessengerConfig) (*Messenger, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return newMessenger(connection, cfg), nil
+}
+
+func newMessenger(connection net.Conn, cfg MessengerConfig) *Messenger {
 	// If we don't specify it behavior for it, we ignore unknown messages
 	onUnknown := func(ctx context.Context, msg *Message) error {
 		return nil
@@ -123,6 +138,7 @@ func NewMessenger(connection net.Conn) *Messenger {
 	return &Messenger{
 		config:                 cfg,
 		receivers:              make(map[uint32]func(context.Context, *Message) error),
+		pendingAcks:            make(map[uint64]chan struct{}),
 		vsock:                  connection,
 		unknownMessageReceiver: onUnknown,
 	}
@@ -179,6 +195,10 @@ func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return ErrNilMessage
 	}
+	if msg.Type == acknowledgeTypeID {
+		m.resolveAck(msg.ID)
+		return nil
+	}
 	if msg.Type == heartbeatTypeID {
 		inMemory, err := materializeStreamMessage(msg)
 		if err != nil {
@@ -192,9 +212,15 @@ func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
 	unknown := m.unknownMessageReceiver
 	m.lock.RUnlock()
 	if handler != nil {
-		return handler(ctx, msg)
+		if err := handler(ctx, msg); err != nil {
+			return err
+		}
+		return m.sendAcknowledge(ctx, msg)
 	}
-	return unknown(ctx, msg)
+	if err := unknown(ctx, msg); err != nil {
+		return err
+	}
+	return m.sendAcknowledge(ctx, msg)
 }
 
 func (m *Messenger) readMessage() (*Message, error) {
@@ -257,4 +283,36 @@ func (m *Messenger) readMessagePayload(header *Message) (*Message, error) {
 		return nil, ErrNilMessage
 	}
 	return materializeStreamMessage(newMessageFromHeader(header, m.vsock))
+}
+
+func (m *Messenger) shouldAwaitAcknowledge(msgType uint32) bool {
+	return m.config.RequireAcknowledge && msgType != acknowledgeTypeID && msgType != heartbeatTypeID
+}
+
+func (m *Messenger) registerPendingAck(id uint64) chan struct{} {
+	ch := make(chan struct{})
+	m.ackLock.Lock()
+	m.pendingAcks[id] = ch
+	m.ackLock.Unlock()
+	return ch
+}
+
+func (m *Messenger) unregisterPendingAck(id uint64, ch chan struct{}) {
+	m.ackLock.Lock()
+	if current, ok := m.pendingAcks[id]; ok && current == ch {
+		delete(m.pendingAcks, id)
+	}
+	m.ackLock.Unlock()
+}
+
+func (m *Messenger) resolveAck(id uint64) {
+	m.ackLock.Lock()
+	ch, ok := m.pendingAcks[id]
+	if ok {
+		delete(m.pendingAcks, id)
+	}
+	m.ackLock.Unlock()
+	if ok {
+		close(ch)
+	}
 }

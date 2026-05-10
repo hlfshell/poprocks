@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 )
 
 type StreamSource interface {
@@ -143,6 +144,61 @@ func (m *Messenger) SendStreamWithID(ctx context.Context, id uint64, msgType uin
 		return fmt.Errorf("message size too large")
 	}
 
+	attempts := 1
+	if m.shouldAwaitAcknowledge(msgType) {
+		attempts += m.config.MaxRetries
+	}
+
+	var payload []byte
+	if attempts > 1 {
+		var err error
+		payload, err = io.ReadAll(io.LimitReader(r, int64(payloadLen)))
+		if err != nil {
+			return err
+		}
+		if len(payload) != int(payloadLen) {
+			return io.ErrUnexpectedEOF
+		}
+		r = bytes.NewReader(payload)
+	}
+
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			r = bytes.NewReader(payload)
+		}
+
+		var wait chan struct{}
+		if m.shouldAwaitAcknowledge(msgType) {
+			wait = m.registerPendingAck(id)
+		}
+
+		if err := m.sendStreamOnce(ctx, id, msgType, payloadLen, r); err != nil {
+			if wait != nil {
+				m.unregisterPendingAck(id, wait)
+			}
+			return err
+		}
+
+		if !m.shouldAwaitAcknowledge(msgType) {
+			return nil
+		}
+
+		err := m.waitForAcknowledge(ctx, id, wait)
+		if err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if attempt == attempts-1 {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (m *Messenger) sendStreamOnce(ctx context.Context, id uint64, msgType uint32, payloadLen uint32, r io.Reader) error {
 	m.writeLock.Lock()
 	defer m.writeLock.Unlock()
 
@@ -186,6 +242,25 @@ func (m *Messenger) SendStreamWithID(ctx context.Context, id uint64, msgType uin
 		}
 	}
 	return nil
+}
+
+func (m *Messenger) waitForAcknowledge(ctx context.Context, id uint64, ch chan struct{}) error {
+	if ch == nil {
+		return fmt.Errorf("ack channel is required")
+	}
+	timeout := m.config.Timeout
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	defer m.unregisterPendingAck(id, ch)
+
+	select {
+	case <-ch:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return fmt.Errorf("acknowledgement timeout for message %d: %w", id, context.DeadlineExceeded)
+	}
 }
 
 func (m *Messenger) writeAll(ctx context.Context, payload []byte) error {

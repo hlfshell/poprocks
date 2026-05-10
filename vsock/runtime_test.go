@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,19 +18,23 @@ type mJSONPayload struct {
 	Name string `json:"name"`
 }
 
-func readOneMessageFromConn(t *testing.T, conn net.Conn) *Message {
-	t.Helper()
+func readOneMessage(conn net.Conn) (*Message, error) {
 	header := make([]byte, headerLength)
 	if _, err := io.ReadFull(conn, header); err != nil {
-		t.Fatalf("read header: %v", err)
+		return nil, err
 	}
 	length := int(binary.BigEndian.Uint32(header[12:16]))
 	raw := make([]byte, headerLength+length)
 	copy(raw[:headerLength], header)
 	if _, err := io.ReadFull(conn, raw[headerLength:]); err != nil {
-		t.Fatalf("read payload: %v", err)
+		return nil, err
 	}
-	msg, err := ParseBinary(raw)
+	return ParseBinary(raw)
+}
+
+func readOneMessageFromConn(t *testing.T, conn net.Conn) *Message {
+	t.Helper()
+	msg, err := readOneMessage(conn)
 	if err != nil {
 		t.Fatalf("parse raw message: %v", err)
 	}
@@ -43,8 +48,8 @@ func TestMessengerConfigValidate(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "ack without timeout invalid",
-			cfg:  MessengerConfig{RequireAcknowledge: true},
+			name:    "ack without timeout invalid",
+			cfg:     MessengerConfig{RequireAcknowledge: true},
 			wantErr: true,
 		},
 		{
@@ -69,15 +74,15 @@ func TestMessengerConfigValidate(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: MessengerConfig{
-				RequireAcknowledge: true,
-				Timeout:            time.Second,
-				MaxRetries:         1,
-				MaxMessageSize:     1024,
+				RequireAcknowledge:     true,
+				Timeout:                time.Second,
+				MaxRetries:             1,
+				MaxMessageSize:         1024,
 				MaxMessageSizeReceived: 2048,
-				Heartbeat:          true,
-				HeartbeatHost:      true,
-				HeartbeatInterval:  100 * time.Millisecond,
-				HeartbeatTimeout:   300 * time.Millisecond,
+				Heartbeat:              true,
+				HeartbeatHost:          true,
+				HeartbeatInterval:      100 * time.Millisecond,
+				HeartbeatTimeout:       300 * time.Millisecond,
 			},
 			wantErr: false,
 		},
@@ -93,6 +98,254 @@ func TestMessengerConfigValidate(t *testing.T) {
 				t.Fatalf("unexpected validation error: %v", err)
 			}
 		})
+	}
+}
+
+func TestDefaultMessengerConfig(t *testing.T) {
+	cfg := DefaultMessengerConfig()
+
+	if cfg.Timeout != DefaultTimeout {
+		t.Fatalf("Timeout = %v, want %v", cfg.Timeout, DefaultTimeout)
+	}
+	if cfg.MaxRetries != DefaultMaxRetries {
+		t.Fatalf("MaxRetries = %d, want %d", cfg.MaxRetries, DefaultMaxRetries)
+	}
+	if cfg.MaxMessageSize != DefaultMaxMessageSize {
+		t.Fatalf("MaxMessageSize = %d, want %d", cfg.MaxMessageSize, DefaultMaxMessageSize)
+	}
+	if cfg.MaxMessageSizeReceived != DefaultMaxMessageSize {
+		t.Fatalf("MaxMessageSizeReceived = %d, want %d", cfg.MaxMessageSizeReceived, DefaultMaxMessageSize)
+	}
+	if cfg.Heartbeat != DefaultHearatbeat {
+		t.Fatalf("Heartbeat = %v, want %v", cfg.Heartbeat, DefaultHearatbeat)
+	}
+	if cfg.HeartbeatHost != DefaultHeartbeatHost {
+		t.Fatalf("HeartbeatHost = %v, want %v", cfg.HeartbeatHost, DefaultHeartbeatHost)
+	}
+	if cfg.HeartbeatInterval != DefaultHeartbeatInterval {
+		t.Fatalf("HeartbeatInterval = %v, want %v", cfg.HeartbeatInterval, DefaultHeartbeatInterval)
+	}
+	if cfg.HeartbeatTimeout != DefaultHeartbeatTimeout {
+		t.Fatalf("HeartbeatTimeout = %v, want %v", cfg.HeartbeatTimeout, DefaultHeartbeatTimeout)
+	}
+}
+
+func TestNewMessengerWithConfig(t *testing.T) {
+	cfg := MessengerConfig{
+		RequireAcknowledge:     true,
+		Timeout:                time.Second,
+		MaxRetries:             2,
+		MaxMessageSize:         1024,
+		MaxMessageSizeReceived: 2048,
+		Heartbeat:              true,
+		HeartbeatHost:          false,
+		HeartbeatInterval:      100 * time.Millisecond,
+		HeartbeatTimeout:       300 * time.Millisecond,
+	}
+
+	m, err := NewMessengerWithConfig(nil, cfg)
+	if err != nil {
+		t.Fatalf("NewMessengerWithConfig() unexpected error: %v", err)
+	}
+	if m == nil {
+		t.Fatal("expected messenger")
+	}
+	if m.config != cfg {
+		t.Fatalf("config mismatch: got %+v want %+v", m.config, cfg)
+	}
+}
+
+func TestNewMessengerWithConfigRejectsInvalidConfig(t *testing.T) {
+	_, err := NewMessengerWithConfig(nil, MessengerConfig{
+		RequireAcknowledge: true,
+	})
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+}
+
+func TestMessengerSendRequiresAcknowledge(t *testing.T) {
+	senderConn, receiverConn := net.Pipe()
+	defer senderConn.Close()
+	defer receiverConn.Close()
+
+	sender, err := NewMessengerWithConfig(senderConn, MessengerConfig{
+		RequireAcknowledge:     true,
+		Timeout:                50 * time.Millisecond,
+		MaxRetries:             0,
+		MaxMessageSize:         DefaultMaxMessageSize,
+		MaxMessageSizeReceived: DefaultMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	receiver := NewMessenger(receiverConn)
+
+	received := make(chan struct{}, 1)
+	if err := receiver.OnReceive(88, func(context.Context, *Message) error {
+		received <- struct{}{}
+		return nil
+	}); err != nil {
+		t.Fatalf("register receiver: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	senderErr := make(chan error, 1)
+	receiverErr := make(chan error, 1)
+	go func() { senderErr <- sender.Serve(ctx) }()
+	go func() { receiverErr <- receiver.Serve(ctx) }()
+
+	if err := sender.Send(ctx, NewMessage(1, 88, []byte("hello"))); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for receiver")
+	}
+
+	cancel()
+	if err := <-senderErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("sender serve error: %v", err)
+	}
+	if err := <-receiverErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("receiver serve error: %v", err)
+	}
+}
+
+func TestMessengerSendRetriesAfterAcknowledgeTimeout(t *testing.T) {
+	senderConn, receiverConn := net.Pipe()
+	defer senderConn.Close()
+	defer receiverConn.Close()
+
+	sender, err := NewMessengerWithConfig(senderConn, MessengerConfig{
+		RequireAcknowledge:     true,
+		Timeout:                20 * time.Millisecond,
+		MaxRetries:             1,
+		MaxMessageSize:         DefaultMaxMessageSize,
+		MaxMessageSizeReceived: DefaultMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	var attempts atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		first, err := readOneMessage(receiverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		attempts.Add(1)
+		if first.ID != 2 || first.Type != 89 {
+			done <- errors.New("unexpected first message")
+			return
+		}
+
+		second, err := readOneMessage(receiverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		attempts.Add(1)
+		if second.ID != 2 || second.Type != 89 {
+			done <- errors.New("unexpected second message")
+			return
+		}
+
+		if _, err := receiverConn.Write(NewMessage(second.ID, acknowledgeTypeID, nil).Binary()); err != nil {
+			done <- err
+			return
+		}
+		done <- nil
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	senderErr := make(chan error, 1)
+	go func() { senderErr <- sender.Serve(ctx) }()
+
+	if err := sender.Send(ctx, NewMessage(2, 89, []byte("retry"))); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("receiver flow: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for retried delivery")
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+
+	cancel()
+	if err := <-senderErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("sender serve error: %v", err)
+	}
+}
+
+func TestMessengerSendFailsWhenAcknowledgeExhausted(t *testing.T) {
+	senderConn, receiverConn := net.Pipe()
+	defer senderConn.Close()
+	defer receiverConn.Close()
+
+	sender, err := NewMessengerWithConfig(senderConn, MessengerConfig{
+		RequireAcknowledge:     true,
+		Timeout:                20 * time.Millisecond,
+		MaxRetries:             1,
+		MaxMessageSize:         DefaultMaxMessageSize,
+		MaxMessageSizeReceived: DefaultMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+	var attempts atomic.Int32
+	done := make(chan error, 1)
+	go func() {
+		for range 2 {
+			msg, err := readOneMessage(receiverConn)
+			if err != nil {
+				done <- err
+				return
+			}
+			attempts.Add(1)
+			if msg.ID != 3 || msg.Type != 90 {
+				done <- errors.New("unexpected retried message")
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	senderErr := make(chan error, 1)
+	go func() { senderErr <- sender.Serve(ctx) }()
+
+	err = sender.Send(ctx, NewMessage(3, 90, []byte("timeout")))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("receiver flow: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for exhausted retries")
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+
+	cancel()
+	if err := <-senderErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("sender serve error: %v", err)
 	}
 }
 
@@ -114,8 +367,25 @@ func TestMessengerSendAndUnknownHandler(t *testing.T) {
 	go func() { _ = m.Send(context.Background(), msg) }()
 	got := readOneMessageFromConn(t, c2)
 
+	type ackResult struct {
+		msg *Message
+		err error
+	}
+	ackRead := make(chan ackResult, 1)
+	go func() {
+		msg, err := readOneMessage(c2)
+		ackRead <- ackResult{msg: msg, err: err}
+	}()
 	if err := m.handleMessage(context.Background(), got); err != nil {
 		t.Fatalf("handle message: %v", err)
+	}
+	ackResultValue := <-ackRead
+	if ackResultValue.err != nil {
+		t.Fatalf("read ack: %v", ackResultValue.err)
+	}
+	ack := ackResultValue.msg
+	if ack.Type != acknowledgeTypeID || ack.ID != got.ID {
+		t.Fatalf("unexpected ack: %+v", ack)
 	}
 	select {
 	case <-done:
@@ -142,20 +412,36 @@ func TestMWrapperFlowAndConflicts(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	w.OnReceive(func(p mJSONPayload) error {
+	w.OnReceive(func(p mJSONPayload) {
 		defer wg.Done()
 		if p.Name != "test" {
-			t.Fatalf("unexpected payload: %+v", p)
+			t.Errorf("unexpected payload: %+v", p)
 		}
-		return nil
 	})
 
 	incoming, err := codec.ToMessage(mJSONPayload{Name: "test"})
 	if err != nil {
 		t.Fatalf("encode incoming: %v", err)
 	}
+	type ackResult struct {
+		msg *Message
+		err error
+	}
+	ackRead := make(chan ackResult, 1)
+	go func() {
+		msg, err := readOneMessage(c2)
+		ackRead <- ackResult{msg: msg, err: err}
+	}()
 	if err := m.handleMessage(context.Background(), incoming); err != nil {
 		t.Fatalf("dispatch incoming: %v", err)
+	}
+	ackResultValue := <-ackRead
+	if ackResultValue.err != nil {
+		t.Fatalf("read ack: %v", ackResultValue.err)
+	}
+	ack := ackResultValue.msg
+	if ack.Type != acknowledgeTypeID || ack.ID != incoming.ID {
+		t.Fatalf("unexpected ack: %+v", ack)
 	}
 	wait := make(chan struct{})
 	go func() { wg.Wait(); close(wait) }()
@@ -179,8 +465,11 @@ func TestMWrapperFlowAndConflicts(t *testing.T) {
 		t.Fatalf("wrapper send error: %v", err)
 	}
 
-	if _, err := NewM[mJSONPayload](nil, nil); err == nil {
-		t.Fatal("expected nil messenger error")
+	if _, err := NewM[mJSONPayload](nil, codec); !errors.Is(err, ErrNilTransport) {
+		t.Fatalf("expected ErrNilTransport, got %v", err)
+	}
+	if _, err := NewM[mJSONPayload](m, nil); !errors.Is(err, ErrNilCodec) {
+		t.Fatalf("expected ErrNilCodec, got %v", err)
 	}
 	if _, err := NewM[mJSONPayload](m, codec); err == nil {
 		t.Fatal("expected duplicate type registration error")
@@ -210,8 +499,8 @@ func TestMessengerServiceEndToEndBidirectional(t *testing.T) {
 
 	hostRecv := make(chan string, 1)
 	clientRecv := make(chan string, 1)
-	hostM.OnReceive(func(p mJSONPayload) error { hostRecv <- p.Name; return nil })
-	clientM.OnReceive(func(p mJSONPayload) error { clientRecv <- p.Name; return nil })
+	hostM.OnReceive(func(p mJSONPayload) { hostRecv <- p.Name })
+	clientM.OnReceive(func(p mJSONPayload) { clientRecv <- p.Name })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	hostErr := make(chan error, 1)
