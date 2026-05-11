@@ -194,6 +194,35 @@ func (m *Messenger) Send(ctx context.Context, msg *Message) error {
 	return m.SendStreamWithID(ctx, msg.ID, msg.Type, uint32(len(payload)), bytes.NewReader(payload))
 }
 
+func (m *Messenger) Request(ctx context.Context, msg *Message, responseType uint32) (*Message, error) {
+	if m == nil || m.vsock == nil {
+		return nil, ErrNilTransport
+	}
+	if msg == nil {
+		return nil, ErrNilMessage
+	}
+	if responseType == 0 {
+		return nil, ErrInvalidTypeID
+	}
+
+	wait := m.registerPendingResponse(msg.ID, responseType)
+	defer m.unregisterPendingResponse(msg.ID, wait)
+
+	if err := m.Send(ctx, msg); err != nil {
+		return nil, err
+	}
+
+	select {
+	case respMsg, ok := <-wait:
+		if !ok || respMsg == nil {
+			return nil, ErrNilMessage
+		}
+		return respMsg, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return ErrNilMessage

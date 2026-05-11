@@ -1,4 +1,4 @@
-package vsock
+package protocol
 
 import (
 	"context"
@@ -9,15 +9,17 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hlfshell/poprocks/vsock"
 )
 
 func TestFileTransferHostToGuestUsesReceiverControlledRoot(t *testing.T) {
-	hostConn, guestConn := netPipe(t)
+	hostConn, guestConn := net.Pipe()
 	defer hostConn.Close()
 	defer guestConn.Close()
 
-	host := NewMessenger(hostConn)
-	guest := NewMessenger(guestConn)
+	host := vsock.NewMessenger(hostConn)
+	guest := vsock.NewMessenger(guestConn)
 
 	hostTransfer, err := NewFileTransfer(host)
 	if err != nil {
@@ -71,12 +73,12 @@ func TestFileTransferHostToGuestUsesReceiverControlledRoot(t *testing.T) {
 }
 
 func TestFileTransferGuestToHostIgnoresSenderDestination(t *testing.T) {
-	hostConn, guestConn := netPipe(t)
+	hostConn, guestConn := net.Pipe()
 	defer hostConn.Close()
 	defer guestConn.Close()
 
-	host := NewMessenger(hostConn)
-	guest := NewMessenger(guestConn)
+	host := vsock.NewMessenger(hostConn)
+	guest := vsock.NewMessenger(guestConn)
 
 	hostTransfer, err := NewFileTransfer(host)
 	if err != nil {
@@ -149,12 +151,12 @@ func TestResolveSenderPathUnderRootRejectsTraversal(t *testing.T) {
 }
 
 func TestFileTransferChecksumMismatchRemovesTempFile(t *testing.T) {
-	hostConn, guestConn := netPipe(t)
+	hostConn, guestConn := net.Pipe()
 	defer hostConn.Close()
 	defer guestConn.Close()
 
-	host := NewMessenger(hostConn)
-	guest := NewMessenger(guestConn)
+	host := vsock.NewMessenger(hostConn)
+	guest := vsock.NewMessenger(guestConn)
 
 	hostTransfer, err := NewFileTransfer(host)
 	if err != nil {
@@ -206,17 +208,12 @@ func TestFileTransferChecksumMismatchRemovesTempFile(t *testing.T) {
 	waitServe(t, errChans...)
 }
 
-func netPipe(t *testing.T) (net.Conn, net.Conn) {
-	t.Helper()
-	return net.Pipe()
-}
-
-func serveMessengers(ctx context.Context, messengers ...*Messenger) []chan error {
+func serveMessengers(ctx context.Context, messengers ...*vsock.Messenger) []chan error {
 	errs := make([]chan error, 0, len(messengers))
 	for _, messenger := range messengers {
 		errCh := make(chan error, 1)
 		errs = append(errs, errCh)
-		go func(m *Messenger, ch chan error) {
+		go func(m *vsock.Messenger, ch chan error) {
 			ch <- m.Serve(ctx)
 		}(messenger, errCh)
 	}

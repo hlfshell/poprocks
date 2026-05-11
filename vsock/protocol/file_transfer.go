@@ -1,4 +1,4 @@
-package vsock
+package protocol
 
 import (
 	"bytes"
@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/hlfshell/poprocks/vsock"
 )
 
 const (
@@ -23,7 +25,6 @@ const (
 	TypeFileTransferCommit uint32 = 0xFFFF0003
 )
 
-// FileTransferRequest opens a transfer session before streaming file bytes.
 type FileTransferRequest struct {
 	TransferID  string `msgpack:"transfer_id"`
 	Name        string `msgpack:"name"`
@@ -32,19 +33,16 @@ type FileTransferRequest struct {
 	SHA256      string `msgpack:"sha256"`
 }
 
-// FileTransferResponse indicates whether the receiver accepted a transfer.
 type FileTransferResponse struct {
 	TransferID string `msgpack:"transfer_id"`
 	Accepted   bool   `msgpack:"accepted"`
 	Error      string `msgpack:"error,omitempty"`
 }
 
-// FileTransferCommit asks the receiver to finalize a streamed transfer.
 type FileTransferCommit struct {
 	TransferID string `msgpack:"transfer_id"`
 }
 
-// FileTransferResult reports the finalized transfer outcome.
 type FileTransferResult struct {
 	TransferID string `msgpack:"transfer_id"`
 	OK         bool   `msgpack:"ok"`
@@ -53,7 +51,6 @@ type FileTransferResult struct {
 	Error      string `msgpack:"error,omitempty"`
 }
 
-// FileTransferPlan is chosen by the receiver and determines where a file lands.
 type FileTransferPlan struct {
 	DestinationPath string
 }
@@ -76,7 +73,7 @@ func (p fileTransferBody) StreamSource() (io.Reader, uint32, error) {
 	if total > uint64(^uint32(0)) {
 		return nil, 0, fmt.Errorf("stream body too large")
 	}
-	return io.MultiReader(bytesReader(header), p.Reader), uint32(total), nil
+	return io.MultiReader(bytes.NewReader(header), p.Reader), uint32(total), nil
 }
 
 type incomingFileTransfer struct {
@@ -90,7 +87,6 @@ type incomingFileTransfer struct {
 	bytesWritten int64
 }
 
-// FileTransfer provides a built-in request plus stream file transfer protocol.
 type FileTransfer struct {
 	open      *R[FileTransferRequest, FileTransferResponse]
 	body      *M[fileTransferBody]
@@ -100,25 +96,24 @@ type FileTransfer struct {
 	onReceive func(context.Context, FileTransferRequest) (FileTransferPlan, error)
 }
 
-// NewFileTransfer wires a file transfer protocol onto an existing messenger.
-func NewFileTransfer(messenger *Messenger) (*FileTransfer, error) {
-	openReqCodec, err := NewCodecOfType[FileTransferRequest](TypeFileTransferOpen, CodecMsgpack)
+func NewFileTransfer(messenger *vsock.Messenger) (*FileTransfer, error) {
+	openReqCodec, err := vsock.NewCodecOfType[FileTransferRequest](TypeFileTransferOpen, vsock.CodecMsgpack)
 	if err != nil {
 		return nil, err
 	}
-	openRespCodec, err := NewCodecOfType[FileTransferResponse](TypeFileTransferOpen+100, CodecMsgpack)
+	openRespCodec, err := vsock.NewCodecOfType[FileTransferResponse](TypeFileTransferOpen+100, vsock.CodecMsgpack)
 	if err != nil {
 		return nil, err
 	}
-	bodyCodec, err := NewCodecOfType[fileTransferBody](TypeFileTransferBody, CodecStream)
+	bodyCodec, err := vsock.NewCodecOfType[fileTransferBody](TypeFileTransferBody, vsock.CodecStream)
 	if err != nil {
 		return nil, err
 	}
-	commitReqCodec, err := NewCodecOfType[FileTransferCommit](TypeFileTransferCommit, CodecMsgpack)
+	commitReqCodec, err := vsock.NewCodecOfType[FileTransferCommit](TypeFileTransferCommit, vsock.CodecMsgpack)
 	if err != nil {
 		return nil, err
 	}
-	commitRespCodec, err := NewCodecOfType[FileTransferResult](TypeFileTransferCommit+100, CodecMsgpack)
+	commitRespCodec, err := vsock.NewCodecOfType[FileTransferResult](TypeFileTransferCommit+100, vsock.CodecMsgpack)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +145,6 @@ func NewFileTransfer(messenger *Messenger) (*FileTransfer, error) {
 	return ft, nil
 }
 
-// OnReceive installs the receiver-side destination policy for incoming files.
 func (f *FileTransfer) OnReceive(handler func(context.Context, FileTransferRequest) (FileTransferPlan, error)) {
 	if f == nil {
 		return
@@ -160,11 +154,10 @@ func (f *FileTransfer) OnReceive(handler func(context.Context, FileTransferReque
 	f.onReceive = handler
 }
 
-// SendFile negotiates, streams, and finalizes a single regular file transfer.
 func (f *FileTransfer) SendFile(ctx context.Context, localPath string, req FileTransferRequest) (FileTransferResult, error) {
 	var zero FileTransferResult
 	if f == nil {
-		return zero, ErrNilTransport
+		return zero, vsock.ErrNilTransport
 	}
 	info, err := os.Stat(localPath)
 	if err != nil {
@@ -241,7 +234,6 @@ func (f *FileTransfer) SendFile(ctx context.Context, localPath string, req FileT
 }
 
 func (f *FileTransfer) handleOpen(ctx context.Context, req FileTransferRequest) (FileTransferResponse, error) {
-	_ = ctx
 	resp := FileTransferResponse{TransferID: req.TransferID}
 	if req.TransferID == "" {
 		resp.Error = "transfer_id is required"
@@ -302,11 +294,11 @@ func (f *FileTransfer) handleOpen(ctx context.Context, req FileTransferRequest) 
 	return resp, nil
 }
 
-func (f *FileTransfer) handleBody(ctx context.Context, msg *Message) error {
+func (f *FileTransfer) handleBody(ctx context.Context, msg *vsock.Message) error {
 	_ = ctx
 	r := msg.Reader()
 	if r == nil {
-		return ErrNilMessage
+		return vsock.ErrNilMessage
 	}
 
 	transferID, err := decodeTransferBodyHeader(r)
@@ -390,8 +382,6 @@ func (f *FileTransfer) handleCommit(ctx context.Context, req FileTransferCommit)
 	return result, nil
 }
 
-// ResolveSenderPathUnderRoot is appropriate when the sender is allowed to
-// suggest a relative destination under a receiver-controlled root.
 func ResolveSenderPathUnderRoot(rootDir, requestedPath, fallbackName string) (string, error) {
 	if rootDir == "" {
 		return "", fmt.Errorf("rootDir is required")
@@ -430,8 +420,6 @@ func ResolveSenderPathUnderRoot(rootDir, requestedPath, fallbackName string) (st
 	return dest, nil
 }
 
-// ResolveHostPathByName is appropriate when the receiver must ignore any
-// sender-chosen destination and place the file under its own controlled root.
 func ResolveHostPathByName(rootDir, name string) (string, error) {
 	if rootDir == "" {
 		return "", fmt.Errorf("rootDir is required")
@@ -496,8 +484,4 @@ func decodeTransferBodyHeader(r io.Reader) (string, error) {
 		return "", err
 	}
 	return string(idBuf), nil
-}
-
-func bytesReader(b []byte) io.Reader {
-	return bytes.NewReader(b)
 }

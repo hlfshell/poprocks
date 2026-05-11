@@ -1,49 +1,41 @@
-package vsock
+package protocol
 
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"sync"
+
+	"github.com/hlfshell/poprocks/vsock"
 )
 
 type M[T any] struct {
 	lock            sync.RWMutex
-	codec           *Codec[T]
+	codec           *vsock.Codec[T]
 	receivers       []func(T)
-	streamReceivers []func(context.Context, *Message) error
-	messenger       *Messenger
+	streamReceivers []func(context.Context, *vsock.Message) error
+	messenger       *vsock.Messenger
 }
 
-func NewM[T any](messenger *Messenger, codec *Codec[T]) (*M[T], error) {
+func NewM[T any](messenger *vsock.Messenger, codec *vsock.Codec[T]) (*M[T], error) {
 	if messenger == nil {
-		return nil, ErrNilTransport
+		return nil, vsock.ErrNilTransport
 	}
 	if codec == nil {
-		return nil, ErrNilCodec
-	}
-
-	// Check to see if we have this typeID already registered or not
-	messenger.lock.Lock()
-	defer messenger.lock.Unlock()
-
-	if _, exists := messenger.receivers[codec.typeID]; exists {
-		return nil, errors.New("typeID already registered; use the existing codec")
+		return nil, vsock.ErrNilCodec
 	}
 
 	m := &M[T]{
-		lock:            sync.RWMutex{},
 		codec:           codec,
 		receivers:       make([]func(T), 0),
-		streamReceivers: make([]func(context.Context, *Message) error, 0),
+		streamReceivers: make([]func(context.Context, *vsock.Message) error, 0),
 		messenger:       messenger,
 	}
 
-	messenger.receivers[codec.typeID] = func(ctx context.Context, streamMsg *Message) error {
+	if err := messenger.OnReceive(codec.TypeID(), func(ctx context.Context, streamMsg *vsock.Message) error {
 		m.lock.RLock()
-		streamReceivers := append([]func(context.Context, *Message) error(nil), m.streamReceivers...)
+		streamReceivers := append([]func(context.Context, *vsock.Message) error(nil), m.streamReceivers...)
 		typedReceivers := append([]func(T){}, m.receivers...)
 		m.lock.RUnlock()
 
@@ -56,23 +48,16 @@ func NewM[T any](messenger *Messenger, codec *Codec[T]) (*M[T], error) {
 			return nil
 		}
 
-		msg, err := materializeStreamMessage(streamMsg)
-		if err != nil {
-			return err
-		}
-		payload, err := msg.ReadAll()
+		payload, err := streamMsg.ReadAll()
 		if err != nil {
 			return err
 		}
 
-		var (
-			t T
-		)
-		if m.codec.Stream {
+		var t T
+		if codec.Stream {
 			t, err = decodeStreamPayload[T](payload)
 		} else {
-			// Convert msg to T
-			t, err = m.codec.Decode(msg)
+			t, err = codec.Decode(vsock.NewMessage(streamMsg.ID, streamMsg.Type, payload))
 		}
 		if err != nil {
 			return err
@@ -81,8 +66,9 @@ func NewM[T any](messenger *Messenger, codec *Codec[T]) (*M[T], error) {
 		for _, receiver := range typedReceivers {
 			receiver(t)
 		}
-
 		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	return m, nil
@@ -90,7 +76,7 @@ func NewM[T any](messenger *Messenger, codec *Codec[T]) (*M[T], error) {
 
 func (m *M[T]) Send(ctx context.Context, payload T) error {
 	if m == nil || m.codec == nil {
-		return ErrNilCodec
+		return vsock.ErrNilCodec
 	}
 	if m.codec.Stream {
 		reader, payloadLen, closer, err := streamSourceFromPayload(any(payload))
@@ -100,18 +86,14 @@ func (m *M[T]) Send(ctx context.Context, payload T) error {
 		if closer != nil {
 			defer func() { _ = closer.Close() }()
 		}
-		id, err := m.codec.generateID()
-		if err != nil {
-			return err
-		}
-		return m.messenger.SendStreamWithID(ctx, id, m.codec.typeID, payloadLen, reader)
+		_, err = m.messenger.SendStream(ctx, m.codec.TypeID(), payloadLen, reader)
+		return err
 	}
 
 	msg, err := m.codec.ToMessage(payload)
 	if err != nil {
 		return err
 	}
-
 	return m.messenger.Send(ctx, msg)
 }
 
@@ -124,12 +106,12 @@ func (m *M[T]) OnReceive(handler func(T)) {
 	m.receivers = append(m.receivers, handler)
 }
 
-func (m *M[T]) OnReceiveStream(handler func(context.Context, *Message) error) error {
+func (m *M[T]) OnReceiveStream(handler func(context.Context, *vsock.Message) error) error {
 	if m == nil {
-		return ErrNilHandler
+		return vsock.ErrNilHandler
 	}
 	if handler == nil {
-		return ErrNilHandler
+		return vsock.ErrNilHandler
 	}
 
 	m.lock.Lock()
@@ -151,4 +133,21 @@ func decodeStreamPayload[T any](payload []byte) (T, error) {
 	default:
 		return zero, fmt.Errorf("stream codec does not support in-memory decode for %T; use OnReceiveStream", zero)
 	}
+}
+
+func streamSourceFromPayload(payload any) (io.Reader, uint32, io.Closer, error) {
+	if payload == nil {
+		return nil, 0, nil, fmt.Errorf("payload is required")
+	}
+	if src, ok := payload.(vsock.StreamSource); ok {
+		r, l, err := src.StreamSource()
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if r == nil {
+			return nil, 0, nil, fmt.Errorf("reader is required")
+		}
+		return r, l, nil, nil
+	}
+	return nil, 0, nil, fmt.Errorf("stream payload must implement StreamSource; got %T", payload)
 }
