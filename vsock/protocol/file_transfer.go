@@ -139,7 +139,9 @@ func NewFileTransfer(messenger *vsock.Messenger) (*FileTransfer, error) {
 	}
 
 	open.OnRequest(ft.handleOpen)
-	body.OnReceiveStream(ft.handleBody)
+	if _, err := body.OnReceiveStream(ft.handleBody); err != nil {
+		return nil, err
+	}
 	commit.OnRequest(ft.handleCommit)
 
 	return ft, nil
