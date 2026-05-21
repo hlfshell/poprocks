@@ -7,6 +7,15 @@ import (
 	"github.com/hlfshell/poprocks/vsock"
 )
 
+/*
+R[Req, Resp] is a request/response wrapper. for vsock messaging. It allows you
+to define a request and expected response types so that more complex messaging
+patterns can be built, such as more useful function calling.
+
+A Request/Response allows only one paired requester and responder, unlike
+messages which can follow a fan out strategy. The codecs for the
+request/response can handle streaming/non streaming payloads as the pair expect.
+*/
 type R[Req any, Resp any] struct {
 	lock          sync.RWMutex
 	requestCodec  *vsock.Codec[Req]
@@ -36,13 +45,12 @@ func NewR[Req any, Resp any](messenger *vsock.Messenger, requestCodec *vsock.Cod
 		}
 
 		r.lock.RLock()
-		handler := r.handler
-		r.lock.RUnlock()
-		if handler == nil {
+		defer r.lock.RUnlock()
+		if r.handler == nil {
 			return vsock.ErrUnhandledMessageType
 		}
 
-		resp, err := handler(ctx, req)
+		resp, err := r.handler(ctx, req)
 		if err != nil {
 			return err
 		}
