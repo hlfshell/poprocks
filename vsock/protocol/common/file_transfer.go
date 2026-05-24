@@ -1,4 +1,4 @@
-package protocol
+package common
 
 import (
 	"bytes"
@@ -17,6 +17,7 @@ import (
 	"sync"
 
 	"github.com/hlfshell/poprocks/vsock"
+	"github.com/hlfshell/poprocks/vsock/protocol"
 )
 
 const (
@@ -88,9 +89,9 @@ type incomingFileTransfer struct {
 }
 
 type FileTransfer struct {
-	open      *R[FileTransferRequest, FileTransferResponse]
-	body      *M[fileTransferBody]
-	commit    *R[FileTransferCommit, FileTransferResult]
+	open      *protocol.R[FileTransferRequest, FileTransferResponse]
+	body      *protocol.M[fileTransferBody]
+	commit    *protocol.R[FileTransferCommit, FileTransferResult]
 	lock      sync.Mutex
 	incoming  map[string]*incomingFileTransfer
 	onReceive func(context.Context, FileTransferRequest) (FileTransferPlan, error)
@@ -118,15 +119,15 @@ func NewFileTransfer(messenger *vsock.Messenger) (*FileTransfer, error) {
 		return nil, err
 	}
 
-	open, err := NewR[FileTransferRequest, FileTransferResponse](messenger, openReqCodec, openRespCodec)
+	open, err := protocol.NewR[FileTransferRequest, FileTransferResponse](messenger, openReqCodec, openRespCodec)
 	if err != nil {
 		return nil, err
 	}
-	body, err := NewM[fileTransferBody](messenger, bodyCodec)
+	body, err := protocol.NewM[fileTransferBody](messenger, bodyCodec)
 	if err != nil {
 		return nil, err
 	}
-	commit, err := NewR[FileTransferCommit, FileTransferResult](messenger, commitReqCodec, commitRespCodec)
+	commit, err := protocol.NewR[FileTransferCommit, FileTransferResult](messenger, commitReqCodec, commitRespCodec)
 	if err != nil {
 		return nil, err
 	}
