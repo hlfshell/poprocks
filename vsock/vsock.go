@@ -223,6 +223,38 @@ func (m *Messenger) Request(ctx context.Context, msg *Message, responseType uint
 	}
 }
 
+func (m *Messenger) RequestStream(ctx context.Context, msgType uint32, payloadLen uint32, r io.Reader, responseType uint32) (*Message, error) {
+	if m == nil || m.vsock == nil {
+		return nil, ErrNilTransport
+	}
+	if r == nil {
+		return nil, fmt.Errorf("reader is required")
+	}
+	if msgType == 0 || responseType == 0 {
+		return nil, ErrInvalidTypeID
+	}
+	id, err := m.newMessageID()
+	if err != nil {
+		return nil, err
+	}
+	wait := m.registerPendingResponse(id, responseType)
+	defer m.unregisterPendingResponse(id, wait)
+
+	if err := m.SendStreamWithID(ctx, id, msgType, payloadLen, r); err != nil {
+		return nil, err
+	}
+
+	select {
+	case respMsg, ok := <-wait:
+		if !ok || respMsg == nil {
+			return nil, ErrNilMessage
+		}
+		return respMsg, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return ErrNilMessage
@@ -388,11 +420,21 @@ func (m *Messenger) resolveResponse(msg *Message) (bool, error) {
 	if !ok || pending.msgType != msg.Type {
 		return false, nil
 	}
-	inMemory, err := materializeStreamMessage(msg)
+	pr, pw := io.Pipe()
+	out := &Message{
+		Header: msg.Header,
+	}
+	newMessageFromHeader(out, pr)
+	pending.ch <- out
+	close(pending.ch)
+
+	_, err := msg.WriteTo(pw)
+	if closeErr := pw.Close(); err == nil {
+		err = closeErr
+	}
 	if err != nil {
+		_ = pr.CloseWithError(err)
 		return false, err
 	}
-	pending.ch <- inMemory
-	close(pending.ch)
 	return true, nil
 }

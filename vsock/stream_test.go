@@ -163,6 +163,62 @@ func TestMessengerStreamWriteToDisk(t *testing.T) {
 	}
 }
 
+func TestMessengerRequestStreamReturnsLiveResponseReader(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	client := NewMessenger(clientConn)
+	server := NewMessenger(serverConn)
+
+	requestPayload := []byte("stream request")
+	responsePayload := bytes.Repeat([]byte("response-"), 128*1024)
+
+	if err := server.OnReceive(9351, func(ctx context.Context, msg *Message) error {
+		_ = ctx
+		got, err := io.ReadAll(msg.Reader())
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(got, requestPayload) {
+			t.Fatalf("unexpected request payload: %q", got)
+		}
+		return server.SendStreamWithID(ctx, msg.ID, 9352, uint32(len(responsePayload)), bytes.NewReader(responsePayload))
+	}); err != nil {
+		t.Fatalf("register request handler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientErr := make(chan error, 1)
+	serverErr := make(chan error, 1)
+	go func() { clientErr <- client.Serve(ctx) }()
+	go func() { serverErr <- server.Serve(ctx) }()
+
+	resp, err := client.RequestStream(ctx, 9351, uint32(len(requestPayload)), bytes.NewReader(requestPayload), 9352)
+	if err != nil {
+		t.Fatalf("request stream: %v", err)
+	}
+	if resp.payloadCache != nil {
+		t.Fatal("response was materialized before being returned")
+	}
+	got, err := io.ReadAll(resp.Reader())
+	if err != nil {
+		t.Fatalf("read response stream: %v", err)
+	}
+	if !bytes.Equal(got, responsePayload) {
+		t.Fatal("response payload mismatch")
+	}
+
+	cancel()
+	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("client serve error: %v", err)
+	}
+	if err := <-serverErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("server serve error: %v", err)
+	}
+}
+
 func TestMessengerSendStreamShortReader(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
