@@ -18,12 +18,14 @@ type Messenger struct {
 	writeLock sync.Mutex
 	hbLock    sync.Mutex
 	ackLock   sync.Mutex
+	respLock  sync.Mutex
 
 	config MessengerConfig
 
 	receivers              map[uint32]func(context.Context, *Message) error
 	unknownMessageReceiver func(context.Context, *Message) error
 	pendingAcks            map[uint64]chan struct{}
+	pendingResponses       map[uint64]pendingResponse
 
 	heartbeat        Heartbeat
 	heartbeatPending chan struct{}
@@ -139,6 +141,7 @@ func newMessenger(connection net.Conn, cfg MessengerConfig) *Messenger {
 		config:                 cfg,
 		receivers:              make(map[uint32]func(context.Context, *Message) error),
 		pendingAcks:            make(map[uint64]chan struct{}),
+		pendingResponses:       make(map[uint64]pendingResponse),
 		vsock:                  connection,
 		unknownMessageReceiver: onUnknown,
 	}
@@ -191,9 +194,75 @@ func (m *Messenger) Send(ctx context.Context, msg *Message) error {
 	return m.SendStreamWithID(ctx, msg.ID, msg.Type, uint32(len(payload)), bytes.NewReader(payload))
 }
 
+func (m *Messenger) Request(ctx context.Context, msg *Message, responseType uint32) (*Message, error) {
+	if m == nil || m.vsock == nil {
+		return nil, ErrNilTransport
+	}
+	if msg == nil {
+		return nil, ErrNilMessage
+	}
+	if responseType == 0 {
+		return nil, ErrInvalidTypeID
+	}
+
+	wait := m.registerPendingResponse(msg.ID, responseType)
+	defer m.unregisterPendingResponse(msg.ID, wait)
+
+	if err := m.Send(ctx, msg); err != nil {
+		return nil, err
+	}
+
+	select {
+	case respMsg, ok := <-wait:
+		if !ok || respMsg == nil {
+			return nil, ErrNilMessage
+		}
+		return respMsg, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (m *Messenger) RequestStream(ctx context.Context, msgType uint32, payloadLen uint32, r io.Reader, responseType uint32) (*Message, error) {
+	if m == nil || m.vsock == nil {
+		return nil, ErrNilTransport
+	}
+	if r == nil {
+		return nil, fmt.Errorf("reader is required")
+	}
+	if msgType == 0 || responseType == 0 {
+		return nil, ErrInvalidTypeID
+	}
+	id, err := m.newMessageID()
+	if err != nil {
+		return nil, err
+	}
+	wait := m.registerPendingResponse(id, responseType)
+	defer m.unregisterPendingResponse(id, wait)
+
+	if err := m.SendStreamWithID(ctx, id, msgType, payloadLen, r); err != nil {
+		return nil, err
+	}
+
+	select {
+	case respMsg, ok := <-wait:
+		if !ok || respMsg == nil {
+			return nil, ErrNilMessage
+		}
+		return respMsg, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (m *Messenger) handleMessage(ctx context.Context, msg *Message) error {
 	if msg == nil {
 		return ErrNilMessage
+	}
+	if resolved, err := m.resolveResponse(msg); err != nil {
+		return err
+	} else if resolved {
+		return m.sendAcknowledge(ctx, msg)
 	}
 	if msg.Type == acknowledgeTypeID {
 		m.resolveAck(msg.ID)
@@ -315,4 +384,57 @@ func (m *Messenger) resolveAck(id uint64) {
 	if ok {
 		close(ch)
 	}
+}
+
+type pendingResponse struct {
+	msgType uint32
+	ch      chan *Message
+}
+
+func (m *Messenger) registerPendingResponse(id uint64, msgType uint32) chan *Message {
+	ch := make(chan *Message, 1)
+	m.respLock.Lock()
+	m.pendingResponses[id] = pendingResponse{msgType: msgType, ch: ch}
+	m.respLock.Unlock()
+	return ch
+}
+
+func (m *Messenger) unregisterPendingResponse(id uint64, ch chan *Message) {
+	m.respLock.Lock()
+	if current, ok := m.pendingResponses[id]; ok && current.ch == ch {
+		delete(m.pendingResponses, id)
+	}
+	m.respLock.Unlock()
+}
+
+func (m *Messenger) resolveResponse(msg *Message) (bool, error) {
+	if m == nil || msg == nil {
+		return false, nil
+	}
+	m.respLock.Lock()
+	pending, ok := m.pendingResponses[msg.ID]
+	if ok && pending.msgType == msg.Type {
+		delete(m.pendingResponses, msg.ID)
+	}
+	m.respLock.Unlock()
+	if !ok || pending.msgType != msg.Type {
+		return false, nil
+	}
+	pr, pw := io.Pipe()
+	out := &Message{
+		Header: msg.Header,
+	}
+	newMessageFromHeader(out, pr)
+	pending.ch <- out
+	close(pending.ch)
+
+	_, err := msg.WriteTo(pw)
+	if closeErr := pw.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = pr.CloseWithError(err)
+		return false, err
+	}
+	return true, nil
 }

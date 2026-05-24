@@ -322,7 +322,8 @@ func materializeStreamMessage(msg *Message) (*Message, error) {
 	return out, nil
 }
 
-func streamSourceFromPayload(payload any) (io.Reader, uint32, io.Closer, error) {
+// StreamSourceFromPayload adapts a StreamSource payload for stream transport.
+func StreamSourceFromPayload(payload any) (io.Reader, uint32, io.Closer, error) {
 	if payload == nil {
 		return nil, 0, nil, fmt.Errorf("payload is required")
 	}

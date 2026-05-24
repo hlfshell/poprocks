@@ -2,173 +2,51 @@
 
 ## Chosen approach
 
-Typed receivers are treated as delivery callbacks, not application-success boundaries.
+`M[T]` has one receiver slot. The codec owns payload conversion, so the receive
+API does not distinguish buffered and stream handlers.
 
 The library contract is:
 
-- decode the frame
-- route it to the typed receiver(s)
-- invoke the registered callback(s)
-
-If that invocation succeeds, the library has done its job.
-
-Application-level failure inside the callback is owned by the callback itself, not by the transport.
+- decode the frame with the configured codec
+- invoke the registered callback
+- return the callback error to the messenger
 
 ## API shape
 
-`M[T].OnReceive` now uses:
+`M[T].OnReceive` uses:
 
 ```go
-func(T)
+func(context.Context, T) error
 ```
 
-instead of:
+and returns an error:
 
 ```go
-func(T) error
+err := wrapper.OnReceive(func(ctx context.Context, evt Event) error {
+	return applyEvent(ctx, evt)
+})
 ```
 
-That keeps the API honest. The old signature implied transport-visible failure handling that did not actually exist.
+`RemoveReceiver()` clears the currently registered receiver.
 
 ## Execution model
 
-Typed callbacks run inline and sequentially:
+Callbacks run inline on the messenger receive path. The receiver lock is held
+only long enough to snapshot the registered callback, then released before
+decoding and invocation.
 
-```go
-for _, receiver := range typedReceivers {
-	receiver(t)
-}
-return nil
-```
+This keeps concurrency explicit: callers that want background processing can
+start their own goroutine inside the callback.
 
-This was chosen over background goroutines because it is simpler and avoids hidden concurrency in the library.
+## Stream codecs
 
-## What success means
+Stream codecs decode into stream-backed payload values. For example,
+`vsock.ReaderPayload` receives the underlying reader and length, while structs
+with settable `Reader` and optional `Length` fields can receive custom stream
+payloads.
 
-For typed receivers, success means:
+## Ack semantics
 
-- the payload decoded successfully
-- the matching typed callback was invoked
-
-It does **not** mean:
-
-- the callback's business operation succeeded
-- downstream persistence succeeded
-- the callback's internal retries or side effects completed
-
-Example:
-
-```go
-wrapper.OnReceive(func(p Job) {
-	if err := processJob(p); err != nil {
-		log.Printf("job failed: %v", err)
-	}
-})
-```
-
-In this model, transport success is still true even if `processJob` logs an application failure.
-
-## Ack semantics under this model
-
-Acknowledged delivery should be read as:
-
-> The message was delivered to the typed callback path.
-
-It should **not** be read as:
-
-> The application's business logic completed successfully.
-
-That means the sender can rely on ack/retry for transport-level delivery, but not as proof of application success.
-
-## Why this approach
-
-This choice keeps the system simpler in a few important ways:
-
-- no dropped handler errors, because typed handlers no longer pretend to return meaningful transport errors
-- no hidden goroutine fanout in the library
-- easier tests and easier reasoning about ordering
-- better alignment between API and behavior
-
-## Tradeoffs
-
-### 1. Callback failures are local-only
-
-If a callback fails, that failure must be handled by the callback itself.
-
-Example:
-
-```go
-wrapper.OnReceive(func(p Job) {
-	if err := writeToDB(p); err != nil {
-		metrics.Inc("job_write_failed")
-		log.Printf("write failed: %v", err)
-	}
-})
-```
-
-### 2. Slow callbacks block the connection
-
-Because callbacks run inline, a slow typed receiver will block later messages on the same messenger.
-
-Example:
-
-```go
-wrapper.OnReceive(func(p Job) {
-	time.Sleep(5 * time.Second)
-})
-```
-
-If a consumer wants background work, it must do that explicitly:
-
-```go
-wrapper.OnReceive(func(p Job) {
-	go func() {
-		if err := processJob(p); err != nil {
-			log.Printf("background job failed: %v", err)
-		}
-	}()
-})
-```
-
-That makes concurrency an application decision instead of an implicit transport policy.
-
-## Practical guidance
-
-### Good fit
-
-```go
-wrapper.OnReceive(func(p Event) {
-	cache.Apply(p)
-})
-```
-
-### Good fit with local failure handling
-
-```go
-wrapper.OnReceive(func(p Event) {
-	if err := projector.Apply(p); err != nil {
-		log.Printf("projection failed: %v", err)
-	}
-})
-```
-
-### If you need application-level success semantics
-
-If a caller needs "work completed successfully" semantics instead of "callback was invoked" semantics, that should be built above `vsock`, not assumed from the transport layer.
-
-Examples:
-
-- an RPC response protocol
-- explicit success/failure reply messages
-- application-level job state tracking
-- idempotent retry logic at the business layer
-
-## Bottom line
-
-The typed wrapper is now intentionally simple:
-
-- `OnReceive(func(T))`
-- inline callback invocation
-- transport-level delivery semantics only
-
-That keeps `vsock` focused on delivery and dispatch, while leaving business success and failure handling to application code.
+Acknowledged delivery means the message reached the registered callback path and
+the callback returned nil. Application-level success beyond that is owned by the
+callback or a higher-level protocol.

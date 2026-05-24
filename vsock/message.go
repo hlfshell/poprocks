@@ -15,13 +15,13 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// Message is an envelope payload for a given message. It is the raw
-// message being sent over the wire. It works by sending:
+// Message is an envelope payload for a given message. It is the raw message
+// being sent over the wire. It works by sending:
 // 1. An 8-byte UUID (uint64)
 // 2. A 4-byte type (uint32)
 // 3. A 4-byte big-endian length prefix (uint32)
 //
-// The ID is for ACK, error handling, timing, etc Type can be ignored (null'ed)
+// The ID is for ACK, error handling, timing, etc.Type can be ignored (null'ed)
 // if not needed. Per application assignment of the types.
 type Message struct {
 	Header
@@ -82,6 +82,7 @@ func NewMessage(id uint64, msgType uint32, payload []byte) *Message {
 	return msg
 }
 
+// ParseBinary accepts a raw byte and separates the payload and headers
 func ParseBinary(raw []byte) (*Message, error) {
 	if len(raw) < headerLength {
 		return nil, errors.New("raw data too short for header")
@@ -119,6 +120,7 @@ type Codec[T any] struct {
 
 type CodecType uint8
 
+// Not conclusive, but common patterns and payload types supported.
 const (
 	CodecUnknown CodecType = iota
 	CodecMsgpack
@@ -173,6 +175,12 @@ func (c *Codec[T]) Encode(value T) ([]byte, error) {
 	return encodeWith(c.codec, value)
 }
 
+// Decode converts a wire message into T.
+//
+// Buffered codecs (ie `.Stream` is false) read the complete payload into memory
+// before unmarshalling. Stream codecs (`.Stream` is true) intentionally skip
+// ReadAll and adapt the message reader into T, so callers can consume the
+// payload incrementally.
 func (c *Codec[T]) Decode(msg *Message) (T, error) {
 	var t T
 	if msg == nil {
@@ -180,6 +188,12 @@ func (c *Codec[T]) Decode(msg *Message) (T, error) {
 	}
 	if msg.Type != c.typeID {
 		return t, fmt.Errorf("message type mismatch: got=%d want=%d", msg.Type, c.typeID)
+	}
+	if c.Stream {
+		// Do not materialize stream payloads. The returned T owns the live
+		// reader, and the receiver must consume it before the messenger drains
+		// the frame.
+		return decodeStreamPayload[T](msg)
 	}
 	payload, err := msg.ReadAll()
 	if err != nil {
@@ -193,11 +207,15 @@ func (c *Codec[T]) Decode(msg *Message) (T, error) {
 }
 
 func (c *Codec[T]) ToMessage(value T) (*Message, error) {
-	payload, err := c.Encode(value)
+	id, err := c.generateID()
 	if err != nil {
 		return nil, err
 	}
-	id, err := c.generateID()
+	return c.ToMessageWithID(id, value)
+}
+
+func (c *Codec[T]) ToMessageWithID(id uint64, value T) (*Message, error) {
+	payload, err := c.Encode(value)
 	if err != nil {
 		return nil, err
 	}
@@ -244,6 +262,74 @@ func decodeWith[T any](codec CodecType, payload []byte, out *T) error {
 	default:
 		return fmt.Errorf("unsupported codec: %d", codec)
 	}
+}
+
+func decodeStreamPayload[T any](msg *Message) (T, error) {
+	var t T
+	reader := msg.Reader()
+	if reader == nil {
+		return t, ErrNilMessage
+	}
+
+	// Fast paths for the stream payload shapes this package explicitly supports.
+	// These avoid reflection and make the intended stream contracts obvious.
+	switch out := any(&t).(type) {
+	case *ReaderPayload:
+		*out = ReaderPayload{Reader: reader, Length: msg.Length}
+		return t, nil
+	case **ReaderPayload:
+		*out = &ReaderPayload{Reader: reader, Length: msg.Length}
+		return t, nil
+	case *io.Reader:
+		*out = reader
+		return t, nil
+	case **Message:
+		*out = msg
+		return t, nil
+	case *Message:
+		*out = *msg
+		return t, nil
+	}
+
+	// Fallback for user-defined stream payload structs. A value or pointer to a
+	// struct may opt in by exposing a settable Reader field and, optionally, a
+	// settable Length field.
+	v := reflect.ValueOf(&t).Elem()
+	if v.Kind() == reflect.Ptr {
+		// For pointer T values, allocate the target struct so its fields can be
+		// populated before returning the pointer.
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return t, fmt.Errorf("stream codec cannot decode into %T", t)
+	}
+
+	// Reader is required: without it, the caller has no way to consume the stream.
+	readerField := v.FieldByName("Reader")
+	if !readerField.IsValid() || !readerField.CanSet() || !reflect.TypeOf(reader).AssignableTo(readerField.Type()) {
+		return t, fmt.Errorf("stream codec cannot set Reader on %T", t)
+	}
+	readerField.Set(reflect.ValueOf(reader))
+
+	// Length is optional metadata. If present, it must use one of the accepted
+	// integer field types so the frame length can be copied without ambiguity.
+	lengthField := v.FieldByName("Length")
+	if lengthField.IsValid() && lengthField.CanSet() {
+		switch lengthField.Kind() {
+		case reflect.Uint32:
+			lengthField.SetUint(uint64(msg.Length))
+		case reflect.Uint64, reflect.Uint, reflect.Uintptr:
+			lengthField.SetUint(uint64(msg.Length))
+		case reflect.Int64, reflect.Int:
+			lengthField.SetInt(int64(msg.Length))
+		default:
+			return t, fmt.Errorf("stream codec cannot set Length on %T", t)
+		}
+	}
+	return t, nil
 }
 
 func inferCodecType[T any]() CodecType {
