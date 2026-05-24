@@ -1,14 +1,12 @@
 package vsock
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"time"
 )
 
 type StreamSource interface {
@@ -25,80 +23,6 @@ func (p ReaderPayload) StreamSource() (io.Reader, uint32, error) {
 		return nil, 0, fmt.Errorf("reader is required")
 	}
 	return p.Reader, p.Length, nil
-}
-
-func newMessageFromHeader(msg *Message, r io.Reader) *Message {
-	if msg == nil {
-		return nil
-	}
-	limited := &io.LimitedReader{
-		R: r,
-		N: int64(msg.Length),
-	}
-	msg.payloadReader = limited
-	msg.Payload = limited
-	return msg
-}
-
-func (m *Message) Reader() io.Reader {
-	if m == nil || m.payloadReader == nil {
-		return nil
-	}
-	return m.payloadReader
-}
-
-func (m *Message) ReadAll() ([]byte, error) {
-	if m == nil {
-		return nil, ErrNilMessage
-	}
-	if m.payloadCache != nil {
-		out := append([]byte(nil), m.payloadCache...)
-		return out, nil
-	}
-	if m.payloadReader == nil {
-		if m.Length == 0 {
-			return nil, nil
-		}
-		return nil, ErrNilMessage
-	}
-	payload, err := io.ReadAll(m.payloadReader)
-	if err != nil {
-		return nil, err
-	}
-	m.payloadCache = payload
-	cachedReader := bytes.NewReader(m.payloadCache)
-	limited := &io.LimitedReader{R: cachedReader, N: int64(len(m.payloadCache))}
-	m.payloadReader = limited
-	m.Payload = limited
-	return append([]byte(nil), payload...), nil
-}
-
-func (m *Message) WriteTo(w io.Writer) (int64, error) {
-	if m == nil {
-		return 0, ErrNilMessage
-	}
-	if w == nil {
-		return 0, fmt.Errorf("writer is required")
-	}
-	if m.payloadCache != nil {
-		r := bytes.NewReader(m.payloadCache)
-		return io.Copy(w, r)
-	}
-	if m.payloadReader == nil {
-		if m.Length == 0 {
-			return 0, nil
-		}
-		return 0, ErrNilMessage
-	}
-	return io.Copy(w, m.payloadReader)
-}
-
-func (m *Message) drain() error {
-	if m == nil || m.payloadReader == nil || m.payloadReader.N == 0 {
-		return nil
-	}
-	_, err := io.Copy(io.Discard, m.payloadReader)
-	return err
 }
 
 func (m *Messenger) newMessageID() (uint64, error) {
@@ -144,58 +68,64 @@ func (m *Messenger) SendStreamWithID(ctx context.Context, id uint64, msgType uin
 		return fmt.Errorf("message size too large")
 	}
 
+	awaitAck := m.shouldAwaitAcknowledge(msgType)
 	attempts := 1
-	if m.shouldAwaitAcknowledge(msgType) {
-		attempts += m.config.MaxRetries
-	}
-
-	var payload []byte
-	if attempts > 1 {
-		var err error
-		payload, err = io.ReadAll(io.LimitReader(r, int64(payloadLen)))
-		if err != nil {
-			return err
+	var seeker io.ReadSeeker
+	var start int64
+	if awaitAck {
+		var ok bool
+		seeker, ok = r.(io.ReadSeeker)
+		if ok {
+			var err error
+			start, err = seeker.Seek(0, io.SeekCurrent)
+			if err != nil {
+				return err
+			}
+			attempts += m.config.MaxRetries
 		}
-		if len(payload) != int(payloadLen) {
-			return io.ErrUnexpectedEOF
-		}
-		r = bytes.NewReader(payload)
 	}
 
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
-			r = bytes.NewReader(payload)
-		}
-
-		var wait chan struct{}
-		if m.shouldAwaitAcknowledge(msgType) {
-			wait = m.registerPendingAck(id)
-		}
-
-		if err := m.sendStreamOnce(ctx, id, msgType, payloadLen, r); err != nil {
-			if wait != nil {
-				m.unregisterPendingAck(id, wait)
+			if _, err := seeker.Seek(start, io.SeekStart); err != nil {
+				return err
 			}
-			return err
 		}
 
-		if !m.shouldAwaitAcknowledge(msgType) {
-			return nil
+		err := m.sendStreamAttempt(ctx, id, msgType, payloadLen, r, awaitAck)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if attempt == attempts-1 {
+				return err
+			}
 		}
-
-		err := m.waitForAcknowledge(ctx, id, wait)
 		if err == nil {
 			return nil
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if attempt == attempts-1 {
-			return err
 		}
 	}
 
 	return nil
+}
+
+func (m *Messenger) sendStreamAttempt(ctx context.Context, id uint64, msgType uint32, payloadLen uint32, r io.Reader, awaitAck bool) error {
+	var wait chan struct{}
+	if awaitAck {
+		wait = m.registerPendingAck(id)
+	}
+
+	if err := m.sendStreamOnce(ctx, id, msgType, payloadLen, r); err != nil {
+		if wait != nil {
+			m.unregisterPendingAck(id, wait)
+		}
+		return err
+	}
+
+	if !awaitAck {
+		return nil
+	}
+	return m.waitForAcknowledge(ctx, id, wait)
 }
 
 func (m *Messenger) sendStreamOnce(ctx context.Context, id uint64, msgType uint32, payloadLen uint32, r io.Reader) error {
@@ -244,25 +174,6 @@ func (m *Messenger) sendStreamOnce(ctx context.Context, id uint64, msgType uint3
 	return nil
 }
 
-func (m *Messenger) waitForAcknowledge(ctx context.Context, id uint64, ch chan struct{}) error {
-	if ch == nil {
-		return fmt.Errorf("ack channel is required")
-	}
-	timeout := m.config.Timeout
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	defer m.unregisterPendingAck(id, ch)
-
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return fmt.Errorf("acknowledgement timeout for message %d: %w", id, context.DeadlineExceeded)
-	}
-}
-
 func (m *Messenger) writeAll(ctx context.Context, payload []byte) error {
 	for len(payload) > 0 {
 		select {
@@ -304,22 +215,6 @@ func (m *Messenger) readHeader() (*Message, error) {
 		return nil, fmt.Errorf("received message size too large")
 	}
 	return msg, nil
-}
-
-func materializeStreamMessage(msg *Message) (*Message, error) {
-	if msg == nil {
-		return nil, ErrNilMessage
-	}
-	payload, err := msg.ReadAll()
-	if err != nil {
-		return nil, err
-	}
-	out := NewMessage(msg.ID, msg.Type, payload)
-	out.Length = msg.Length
-	if err := out.Validate(); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 // StreamSourceFromPayload adapts a StreamSource payload for stream transport.
