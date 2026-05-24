@@ -240,3 +240,74 @@ func TestMessengerSendStreamShortReader(t *testing.T) {
 		t.Fatalf("peer read failed: %v", err)
 	}
 }
+
+func TestMessengerSendStreamRejectsOversizedMessage(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	m := NewMessenger(c1)
+	m.config.MaxMessageSize = headerLength + 4
+	_, err := m.SendStream(context.Background(), 9403, 5, bytes.NewReader([]byte("hello")))
+	if err == nil || err.Error() != "message size too large" {
+		t.Fatalf("expected message size too large error, got %v", err)
+	}
+}
+
+type nonReplayableReader struct {
+	r io.Reader
+}
+
+func (r *nonReplayableReader) Read(p []byte) (int, error) {
+	return r.r.Read(p)
+}
+
+func TestMessengerSendStreamDoesNotRetryNonReplayableReader(t *testing.T) {
+	senderConn, receiverConn := net.Pipe()
+	defer senderConn.Close()
+	defer receiverConn.Close()
+
+	sender, err := NewMessengerWithConfig(senderConn, MessengerConfig{
+		RequireAcknowledge:     true,
+		Timeout:                20 * time.Millisecond,
+		MaxRetries:             2,
+		MaxMessageSize:         DefaultMaxMessageSize,
+		MaxMessageSizeReceived: DefaultMaxMessageSize,
+	})
+	if err != nil {
+		t.Fatalf("new sender: %v", err)
+	}
+
+	payload := []byte("stream-once")
+	done := make(chan error, 1)
+	go func() {
+		msg, err := readOneMessage(receiverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		if msg.Type != 9402 {
+			done <- errors.New("unexpected message type")
+			return
+		}
+		done <- nil
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	senderErr := make(chan error, 1)
+	go func() { senderErr <- sender.Serve(ctx) }()
+
+	err = sender.SendStreamWithID(ctx, 44, 9402, uint32(len(payload)), &nonReplayableReader{r: bytes.NewReader(payload)})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded after one send, got %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("receiver flow: %v", err)
+	}
+
+	cancel()
+	if err := <-senderErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("sender serve error: %v", err)
+	}
+}

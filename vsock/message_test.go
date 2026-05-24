@@ -141,12 +141,9 @@ func TestNewCodecErrors(t *testing.T) {
 	})
 
 	t.Run("invalid explicit encoding", func(t *testing.T) {
-		codec, err := NewCodecOfType[msgpackPayload](1, CodecType(255))
-		if err != nil {
-			t.Fatalf("NewCodecWithEncoding() unexpected error: %v", err)
-		}
-		if _, err := codec.ToMessage(msgpackPayload{Name: "x"}); err == nil {
-			t.Fatal("ToMessage() expected unsupported codec error")
+		_, err := NewCodecOfType[msgpackPayload](1, CodecType(255))
+		if !errors.Is(err, ErrInvalidCodecType) {
+			t.Fatalf("expected ErrInvalidCodecType, got: %v", err)
 		}
 	})
 }

@@ -1,6 +1,7 @@
 package vsock
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -9,8 +10,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 type mJSONPayload struct {
@@ -52,15 +51,6 @@ func TestMessengerConfigValidate(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "heartbeat timeout not greater invalid",
-			cfg: MessengerConfig{
-				Heartbeat:         true,
-				HeartbeatInterval: 2 * time.Second,
-				HeartbeatTimeout:  1 * time.Second,
-			},
-			wantErr: true,
-		},
-		{
 			name:    "negative retries invalid",
 			cfg:     MessengerConfig{MaxRetries: -1},
 			wantErr: true,
@@ -78,10 +68,6 @@ func TestMessengerConfigValidate(t *testing.T) {
 				MaxRetries:             1,
 				MaxMessageSize:         1024,
 				MaxMessageSizeReceived: 2048,
-				Heartbeat:              true,
-				HeartbeatHost:          true,
-				HeartbeatInterval:      100 * time.Millisecond,
-				HeartbeatTimeout:       300 * time.Millisecond,
 			},
 			wantErr: false,
 		},
@@ -115,18 +101,6 @@ func TestDefaultMessengerConfig(t *testing.T) {
 	if cfg.MaxMessageSizeReceived != DefaultMaxMessageSize {
 		t.Fatalf("MaxMessageSizeReceived = %d, want %d", cfg.MaxMessageSizeReceived, DefaultMaxMessageSize)
 	}
-	if cfg.Heartbeat != DefaultHearatbeat {
-		t.Fatalf("Heartbeat = %v, want %v", cfg.Heartbeat, DefaultHearatbeat)
-	}
-	if cfg.HeartbeatHost != DefaultHeartbeatHost {
-		t.Fatalf("HeartbeatHost = %v, want %v", cfg.HeartbeatHost, DefaultHeartbeatHost)
-	}
-	if cfg.HeartbeatInterval != DefaultHeartbeatInterval {
-		t.Fatalf("HeartbeatInterval = %v, want %v", cfg.HeartbeatInterval, DefaultHeartbeatInterval)
-	}
-	if cfg.HeartbeatTimeout != DefaultHeartbeatTimeout {
-		t.Fatalf("HeartbeatTimeout = %v, want %v", cfg.HeartbeatTimeout, DefaultHeartbeatTimeout)
-	}
 }
 
 func TestNewMessengerWithConfig(t *testing.T) {
@@ -136,10 +110,6 @@ func TestNewMessengerWithConfig(t *testing.T) {
 		MaxRetries:             2,
 		MaxMessageSize:         1024,
 		MaxMessageSizeReceived: 2048,
-		Heartbeat:              true,
-		HeartbeatHost:          false,
-		HeartbeatInterval:      100 * time.Millisecond,
-		HeartbeatTimeout:       300 * time.Millisecond,
 	}
 
 	m, err := NewMessengerWithConfig(nil, cfg)
@@ -348,6 +318,157 @@ func TestMessengerSendFailsWhenAcknowledgeExhausted(t *testing.T) {
 	}
 }
 
+func TestMessengerRequestRejectsDuplicatePendingID(t *testing.T) {
+	m := NewMessenger(nil)
+	wait, err := m.registerPendingResponse(33, 92)
+	if err != nil {
+		t.Fatalf("register first response: %v", err)
+	}
+	defer m.unregisterPendingResponse(33, wait)
+
+	_, err = m.registerPendingResponse(33, 92)
+	if !errors.Is(err, ErrDuplicateMessageID) {
+		t.Fatalf("expected ErrDuplicateMessageID, got %v", err)
+	}
+}
+
+func TestMessengerRequestBufferedEndToEnd(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	client := NewMessenger(clientConn)
+	server := NewMessenger(serverConn)
+
+	if err := server.OnReceive(6101, func(ctx context.Context, msg *Message) error {
+		body, err := msg.ReadAll()
+		if err != nil {
+			return err
+		}
+		return server.Send(ctx, NewMessage(msg.ID, 6102, append([]byte("resp:"), body...)))
+	}); err != nil {
+		t.Fatalf("register server handler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientErr := make(chan error, 1)
+	serverErr := make(chan error, 1)
+	go func() { clientErr <- client.Serve(ctx) }()
+	go func() { serverErr <- server.Serve(ctx) }()
+
+	resp, err := client.Request(ctx, NewMessage(101, 6101, []byte("hello")), 6102)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	got, err := resp.ReadAll()
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if string(got) != "resp:hello" {
+		t.Fatalf("response payload = %q", got)
+	}
+
+	cancel()
+	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("client serve error: %v", err)
+	}
+	if err := <-serverErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("server serve error: %v", err)
+	}
+}
+
+func TestMessengerConcurrentSameTypeRequestsRouteByID(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	client := NewMessenger(clientConn)
+	server := NewMessenger(serverConn)
+
+	if err := server.OnReceive(6201, func(ctx context.Context, msg *Message) error {
+		body, err := msg.ReadAll()
+		if err != nil {
+			return err
+		}
+		return server.Send(ctx, NewMessage(msg.ID, 6202, append([]byte("ok:"), body...)))
+	}); err != nil {
+		t.Fatalf("register server handler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientErr := make(chan error, 1)
+	serverErr := make(chan error, 1)
+	go func() { clientErr <- client.Serve(ctx) }()
+	go func() { serverErr <- server.Serve(ctx) }()
+
+	const total = 8
+	errs := make(chan error, total)
+	for i := range total {
+		go func(i int) {
+			payload := []byte{byte('a' + i)}
+			resp, err := client.Request(ctx, NewMessage(uint64(200+i), 6201, payload), 6202)
+			if err != nil {
+				errs <- err
+				return
+			}
+			got, err := resp.ReadAll()
+			if err != nil {
+				errs <- err
+				return
+			}
+			want := append([]byte("ok:"), payload...)
+			if !bytes.Equal(got, want) {
+				errs <- errors.New("response payload mismatch")
+				return
+			}
+			errs <- nil
+		}(i)
+	}
+
+	for range total {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for concurrent requests")
+		}
+	}
+
+	cancel()
+	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("client serve error: %v", err)
+	}
+	if err := <-serverErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("server serve error: %v", err)
+	}
+}
+
+func TestMessengerResponseTypeMismatchDoesNotResolvePendingRequest(t *testing.T) {
+	m := NewMessenger(nil)
+	wait, err := m.registerPendingResponse(44, 7002)
+	if err != nil {
+		t.Fatalf("register pending response: %v", err)
+	}
+	defer m.unregisterPendingResponse(44, wait)
+
+	resolved, err := m.resolveResponse(NewMessage(44, 7003, []byte("wrong type")))
+	if err != nil {
+		t.Fatalf("resolve response: %v", err)
+	}
+	if resolved {
+		t.Fatal("response with mismatched type should not resolve")
+	}
+	select {
+	case <-wait:
+		t.Fatal("pending response channel should not receive mismatched response")
+	default:
+	}
+}
+
 func TestMessengerSendAndUnknownHandler(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
@@ -393,6 +514,76 @@ func TestMessengerSendAndUnknownHandler(t *testing.T) {
 	}
 }
 
+func TestMessengerUnknownMessageWithoutHandlerIsAcked(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	m := NewMessenger(c1)
+	msg := NewMessage(5, 4321, []byte("abc"))
+	go func() { _ = m.Send(context.Background(), msg) }()
+	got := readOneMessageFromConn(t, c2)
+
+	ackRead := make(chan *Message, 1)
+	go func() {
+		ack, _ := readOneMessage(c2)
+		ackRead <- ack
+	}()
+	if err := m.handleMessage(context.Background(), got); err != nil {
+		t.Fatalf("handle message: %v", err)
+	}
+	select {
+	case ack := <-ackRead:
+		if ack == nil || ack.Type != acknowledgeTypeID || ack.ID != got.ID {
+			t.Fatalf("unexpected ack: %+v", ack)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ack")
+	}
+}
+
+func TestMessengerHandleMessagePropagatesHandlerError(t *testing.T) {
+	m := NewMessenger(nil)
+	want := errors.New("handler failed")
+	if err := m.OnReceive(8101, func(context.Context, *Message) error {
+		return want
+	}); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+	err := m.handleMessage(context.Background(), NewMessage(1, 8101, nil))
+	if !errors.Is(err, want) {
+		t.Fatalf("expected handler error, got %v", err)
+	}
+}
+
+func TestMessengerOnReceiveValidation(t *testing.T) {
+	m := NewMessenger(nil)
+	if err := m.OnReceive(1, nil); !errors.Is(err, ErrNilHandler) {
+		t.Fatalf("expected ErrNilHandler, got %v", err)
+	}
+	if err := m.OnReceive(0, func(context.Context, *Message) error { return nil }); !errors.Is(err, ErrInvalidTypeID) {
+		t.Fatalf("expected ErrInvalidTypeID, got %v", err)
+	}
+	if err := m.OnReceive(1, func(context.Context, *Message) error { return nil }); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+	if err := m.OnReceive(1, func(context.Context, *Message) error { return nil }); !errors.Is(err, ErrHandlerAlreadyRegistered) {
+		t.Fatalf("expected ErrHandlerAlreadyRegistered, got %v", err)
+	}
+}
+
+func TestMessengerSendValidation(t *testing.T) {
+	if err := NewMessenger(nil).Send(context.Background(), NewMessage(1, 2, nil)); !errors.Is(err, ErrNilTransport) {
+		t.Fatalf("expected ErrNilTransport, got %v", err)
+	}
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	if err := NewMessenger(c1).Send(context.Background(), nil); !errors.Is(err, ErrNilMessage) {
+		t.Fatalf("expected ErrNilMessage, got %v", err)
+	}
+}
+
 func TestReadMessageLimitAndServeErrors(t *testing.T) {
 	sender, receiver := net.Pipe()
 	defer sender.Close()
@@ -403,7 +594,7 @@ func TestReadMessageLimitAndServeErrors(t *testing.T) {
 	codec, _ := NewCodec[mJSONPayload](501)
 	msg, _ := codec.ToMessage(mJSONPayload{Name: "too-big"})
 	go func() { _ = NewMessenger(sender).Send(context.Background(), msg) }()
-	if _, err := m.readMessage(); err == nil {
+	if _, err := m.readHeader(); err == nil {
 		t.Fatal("expected read size limit error")
 	}
 
@@ -424,97 +615,6 @@ func TestReadMessageLimitAndServeErrors(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("serve did not stop on close")
-	}
-}
-
-func TestHeartbeatBehaviorAndHelpers(t *testing.T) {
-	m := NewMessenger(nil)
-	m.config.Heartbeat = false
-	m.config.HeartbeatHost = true
-	m.StartHeartbeat(context.Background())
-	if m.heartbeatStarted {
-		t.Fatal("heartbeat should not start when disabled")
-	}
-	if got := m.snapshotHealth(); got != nil {
-		t.Fatalf("expected nil health by default, got %#v", got)
-	}
-	m.OnHeartbeatHealth(func() map[string]any { return map[string]any{"ok": true} })
-	if got := m.snapshotHealth(); got == nil || got["ok"] != true {
-		t.Fatalf("unexpected heartbeat health callback result: %#v", got)
-	}
-
-	m.config.HeartbeatInterval = 0
-	m.config.HeartbeatTimeout = 0
-	if m.heartbeatInterval() != DefaultHeartbeatInterval {
-		t.Fatal("expected default heartbeat interval")
-	}
-	if m.heartbeatTimeout() != DefaultHeartbeatTimeout {
-		t.Fatal("expected default heartbeat timeout")
-	}
-
-	m.setHeartbeatStatus(HeartbeatStatusError)
-	if m.HeartbeatState().Status != HeartbeatStatusError {
-		t.Fatal("expected heartbeat status update")
-	}
-	m.heartbeatStarted = true
-	m.stopHeartbeat()
-	if m.heartbeatStarted {
-		t.Fatal("expected heartbeat stop to clear started flag")
-	}
-
-	cancelled, cancel := context.WithCancel(context.Background())
-	cancel()
-	m.heartbeatStarted = true
-	m.heartbeatLoop(cancelled)
-	if m.heartbeatStarted {
-		t.Fatal("expected cancelled heartbeat loop to stop")
-	}
-}
-
-func TestHeartbeatClientHostMessageFlow(t *testing.T) {
-	clientConn, hostConn := net.Pipe()
-	defer clientConn.Close()
-	defer hostConn.Close()
-
-	client := NewMessenger(clientConn)
-	client.config.Heartbeat = true
-	client.config.HeartbeatHost = false
-
-	host := NewMessenger(hostConn)
-	host.config.Heartbeat = true
-	host.config.HeartbeatHost = true
-
-	req := heartbeatPayload{SentAt: time.Now(), Status: HeartbeatStatusOK}
-	reqMsg, err := client.newHeartbeatMessage(req)
-	if err != nil {
-		t.Fatalf("new heartbeat message: %v", err)
-	}
-	go func() { _ = client.handleHeartbeatMessage(context.Background(), reqMsg) }()
-	resp := readOneMessageFromConn(t, hostConn)
-	respPayload, err := resp.ReadAll()
-	if err != nil {
-		t.Fatalf("read heartbeat payload: %v", err)
-	}
-
-	var rp heartbeatPayload
-	if err := msgpack.Unmarshal(respPayload, &rp); err != nil {
-		t.Fatalf("unmarshal heartbeat response: %v", err)
-	}
-	if rp.Status != HeartbeatStatusOK {
-		t.Fatalf("unexpected heartbeat status: %d", rp.Status)
-	}
-
-	done := make(chan struct{})
-	host.hbLock.Lock()
-	host.heartbeatPending = done
-	host.hbLock.Unlock()
-	if err := host.handleHeartbeatMessage(context.Background(), resp); err != nil {
-		t.Fatalf("host handle heartbeat response: %v", err)
-	}
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("host pending heartbeat was not resolved")
 	}
 }
 

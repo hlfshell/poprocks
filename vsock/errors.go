@@ -13,4 +13,5 @@ var (
 
 	ErrHandlerAlreadyRegistered = errors.New("handler already registered")
 	ErrUnhandledMessageType     = errors.New("unhandled message type")
+	ErrDuplicateMessageID       = errors.New("duplicate message ID")
 )
