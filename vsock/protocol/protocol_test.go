@@ -49,11 +49,13 @@ func TestMWrapperFlowAndConflicts(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	if _, err := hostM.OnReceive(func(p mJSONPayload) {
+	if err := hostM.OnReceive(func(ctx context.Context, p mJSONPayload) error {
+		_ = ctx
 		defer wg.Done()
 		if p.Name != "test" {
 			t.Errorf("unexpected payload: %+v", p)
 		}
+		return nil
 	}); err != nil {
 		t.Fatalf("register receiver: %v", err)
 	}
@@ -119,10 +121,18 @@ func TestMessengerServiceEndToEndBidirectional(t *testing.T) {
 
 	hostRecv := make(chan string, 1)
 	clientRecv := make(chan string, 1)
-	if _, err := hostM.OnReceive(func(p mJSONPayload) { hostRecv <- p.Name }); err != nil {
+	if err := hostM.OnReceive(func(ctx context.Context, p mJSONPayload) error {
+		_ = ctx
+		hostRecv <- p.Name
+		return nil
+	}); err != nil {
 		t.Fatalf("register host receiver: %v", err)
 	}
-	if _, err := clientM.OnReceive(func(p mJSONPayload) { clientRecv <- p.Name }); err != nil {
+	if err := clientM.OnReceive(func(ctx context.Context, p mJSONPayload) error {
+		_ = ctx
+		clientRecv <- p.Name
+		return nil
+	}); err != nil {
 		t.Fatalf("register client receiver: %v", err)
 	}
 
@@ -191,10 +201,12 @@ func TestRequestResponseEndToEnd(t *testing.T) {
 		t.Fatalf("new client request wrapper: %v", err)
 	}
 
-	server.OnRequest(func(ctx context.Context, req requestPayload) (responsePayload, error) {
+	if err := server.OnRequest(func(ctx context.Context, req requestPayload) (responsePayload, error) {
 		_ = ctx
 		return responsePayload{Reply: "hello " + req.Name}, nil
-	})
+	}); err != nil {
+		t.Fatalf("register request receiver: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -209,6 +221,209 @@ func TestRequestResponseEndToEnd(t *testing.T) {
 	}
 	if resp.Reply != "hello vm" {
 		t.Fatalf("unexpected response: %+v", resp)
+	}
+
+	cancel()
+	if err := <-hostErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("host serve error: %v", err)
+	}
+	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("client serve error: %v", err)
+	}
+}
+
+func TestRequestResponseStreamEndToEnd(t *testing.T) {
+	hostConn, clientConn := net.Pipe()
+	defer hostConn.Close()
+	defer clientConn.Close()
+
+	host := vsock.NewMessenger(hostConn)
+	client := vsock.NewMessenger(clientConn)
+
+	reqCodec, err := vsock.NewCodec[vsock.ReaderPayload](1211)
+	if err != nil {
+		t.Fatalf("request codec: %v", err)
+	}
+	respCodec, err := vsock.NewCodec[vsock.ReaderPayload](1212)
+	if err != nil {
+		t.Fatalf("response codec: %v", err)
+	}
+
+	server, err := NewR[vsock.ReaderPayload, vsock.ReaderPayload](host, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new server request wrapper: %v", err)
+	}
+	clientReq, err := NewR[vsock.ReaderPayload, vsock.ReaderPayload](client, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new client request wrapper: %v", err)
+	}
+
+	if err := server.OnRequest(func(ctx context.Context, req vsock.ReaderPayload) (vsock.ReaderPayload, error) {
+		_ = ctx
+		body, err := io.ReadAll(req.Reader)
+		if err != nil {
+			return vsock.ReaderPayload{}, err
+		}
+		out := append([]byte("echo:"), body...)
+		return vsock.ReaderPayload{
+			Reader: bytes.NewReader(out),
+			Length: uint32(len(out)),
+		}, nil
+	}); err != nil {
+		t.Fatalf("register stream request receiver: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hostErr := make(chan error, 1)
+	clientErr := make(chan error, 1)
+	go func() { hostErr <- host.Serve(ctx) }()
+	go func() { clientErr <- client.Serve(ctx) }()
+
+	input := []byte("stream request body")
+	resp, err := clientReq.Request(ctx, vsock.ReaderPayload{
+		Reader: bytes.NewReader(input),
+		Length: uint32(len(input)),
+	})
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	got, err := io.ReadAll(resp.Reader)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	if want := append([]byte("echo:"), input...); !bytes.Equal(got, want) {
+		t.Fatalf("unexpected stream response: got=%q want=%q", got, want)
+	}
+
+	cancel()
+	if err := <-hostErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("host serve error: %v", err)
+	}
+	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("client serve error: %v", err)
+	}
+}
+
+func TestRequestResponseStreamRequestBufferedResponseEndToEnd(t *testing.T) {
+	hostConn, clientConn := net.Pipe()
+	defer hostConn.Close()
+	defer clientConn.Close()
+
+	host := vsock.NewMessenger(hostConn)
+	client := vsock.NewMessenger(clientConn)
+
+	reqCodec, err := vsock.NewCodec[vsock.ReaderPayload](1213)
+	if err != nil {
+		t.Fatalf("request codec: %v", err)
+	}
+	respCodec, err := vsock.NewCodecOfType[responsePayload](1214, vsock.CodecJSON)
+	if err != nil {
+		t.Fatalf("response codec: %v", err)
+	}
+
+	server, err := NewR[vsock.ReaderPayload, responsePayload](host, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new server request wrapper: %v", err)
+	}
+	clientReq, err := NewR[vsock.ReaderPayload, responsePayload](client, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new client request wrapper: %v", err)
+	}
+
+	if err := server.OnRequest(func(ctx context.Context, req vsock.ReaderPayload) (responsePayload, error) {
+		_ = ctx
+		body, err := io.ReadAll(req.Reader)
+		if err != nil {
+			return responsePayload{}, err
+		}
+		return responsePayload{Reply: "read " + string(body)}, nil
+	}); err != nil {
+		t.Fatalf("register stream request receiver: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hostErr := make(chan error, 1)
+	clientErr := make(chan error, 1)
+	go func() { hostErr <- host.Serve(ctx) }()
+	go func() { clientErr <- client.Serve(ctx) }()
+
+	input := []byte("stream input")
+	resp, err := clientReq.Request(ctx, vsock.ReaderPayload{
+		Reader: bytes.NewReader(input),
+		Length: uint32(len(input)),
+	})
+	if err != nil {
+		t.Fatalf("stream request: %v", err)
+	}
+	if resp.Reply != "read stream input" {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+
+	cancel()
+	if err := <-hostErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("host serve error: %v", err)
+	}
+	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("client serve error: %v", err)
+	}
+}
+
+func TestRequestResponseBufferedRequestStreamResponseEndToEnd(t *testing.T) {
+	hostConn, clientConn := net.Pipe()
+	defer hostConn.Close()
+	defer clientConn.Close()
+
+	host := vsock.NewMessenger(hostConn)
+	client := vsock.NewMessenger(clientConn)
+
+	reqCodec, err := vsock.NewCodecOfType[requestPayload](1215, vsock.CodecJSON)
+	if err != nil {
+		t.Fatalf("request codec: %v", err)
+	}
+	respCodec, err := vsock.NewCodec[vsock.ReaderPayload](1216)
+	if err != nil {
+		t.Fatalf("response codec: %v", err)
+	}
+
+	server, err := NewR[requestPayload, vsock.ReaderPayload](host, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new server request wrapper: %v", err)
+	}
+	clientReq, err := NewR[requestPayload, vsock.ReaderPayload](client, reqCodec, respCodec)
+	if err != nil {
+		t.Fatalf("new client request wrapper: %v", err)
+	}
+
+	if err := server.OnRequest(func(ctx context.Context, req requestPayload) (vsock.ReaderPayload, error) {
+		_ = ctx
+		out := []byte("stream reply to " + req.Name)
+		return vsock.ReaderPayload{
+			Reader: bytes.NewReader(out),
+			Length: uint32(len(out)),
+		}, nil
+	}); err != nil {
+		t.Fatalf("register request receiver: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hostErr := make(chan error, 1)
+	clientErr := make(chan error, 1)
+	go func() { hostErr <- host.Serve(ctx) }()
+	go func() { clientErr <- client.Serve(ctx) }()
+
+	resp, err := clientReq.Request(ctx, requestPayload{Name: "vm"})
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	got, err := io.ReadAll(resp.Reader)
+	if err != nil {
+		t.Fatalf("read stream response: %v", err)
+	}
+	if string(got) != "stream reply to vm" {
+		t.Fatalf("unexpected stream response: %q", got)
 	}
 
 	cancel()
@@ -291,15 +506,43 @@ func TestNewRRejectsNilAndDuplicate(t *testing.T) {
 	if _, err := NewR[requestPayload, responsePayload](m, reqCodec, nil); !errors.Is(err, vsock.ErrNilCodec) {
 		t.Fatalf("expected ErrNilCodec for nil response codec, got %v", err)
 	}
-	if _, err := NewR[requestPayload, responsePayload](m, reqCodec, respCodec); err != nil {
+	r, err := NewR[requestPayload, responsePayload](m, reqCodec, respCodec)
+	if err != nil {
 		t.Fatalf("first NewR failed: %v", err)
 	}
 	if _, err := NewR[requestPayload, responsePayload](m, reqCodec, respCodec); err == nil {
 		t.Fatal("expected duplicate request type registration error")
 	}
+	if err := r.OnRequest(func(context.Context, requestPayload) (responsePayload, error) {
+		return responsePayload{}, nil
+	}); err != nil {
+		t.Fatalf("register request receiver: %v", err)
+	}
+	if err := r.OnRequest(func(context.Context, requestPayload) (responsePayload, error) {
+		return responsePayload{}, nil
+	}); !errors.Is(err, vsock.ErrHandlerAlreadyRegistered) {
+		t.Fatalf("expected ErrHandlerAlreadyRegistered for second request receiver, got %v", err)
+	}
+	if !r.RemoveReceiver() {
+		t.Fatal("expected request receiver removal to succeed")
+	}
+	if r.RemoveReceiver() {
+		t.Fatal("expected second request receiver removal to fail")
+	}
+	if err := r.OnRequest(func(context.Context, requestPayload) (responsePayload, error) {
+		return responsePayload{}, nil
+	}); err != nil {
+		t.Fatalf("register request receiver after removal: %v", err)
+	}
+	if !r.RemoveReceiver() {
+		t.Fatal("expected request receiver removal to succeed")
+	}
+	if err := r.OnRequest(nil); !errors.Is(err, vsock.ErrNilHandler) {
+		t.Fatalf("expected ErrNilHandler for nil request receiver, got %v", err)
+	}
 }
 
-func TestMReceiverIDAndRemoval(t *testing.T) {
+func TestMReceiverRemoval(t *testing.T) {
 	hostConn, clientConn := net.Pipe()
 	defer hostConn.Close()
 	defer clientConn.Close()
@@ -320,30 +563,26 @@ func TestMReceiverIDAndRemoval(t *testing.T) {
 		t.Fatalf("new client wrapper: %v", err)
 	}
 
-	removed := make(chan string, 1)
 	active := make(chan string, 1)
-	removedID, err := hostM.OnReceive(func(p mJSONPayload) { removed <- p.Name })
-	if err != nil {
+	if err := hostM.OnReceive(func(ctx context.Context, p mJSONPayload) error {
+		_ = ctx
+		t.Fatalf("removed receiver was called with %q", p.Name)
+		return nil
+	}); err != nil {
 		t.Fatalf("register removed receiver: %v", err)
 	}
-	activeID, err := hostM.OnReceive(func(p mJSONPayload) { active <- p.Name })
-	if err != nil {
-		t.Fatalf("register active receiver: %v", err)
-	}
-	if removedID == "" || activeID == "" {
-		t.Fatal("expected receiver ids")
-	}
-	if removedID == activeID {
-		t.Fatal("expected unique receiver ids")
-	}
-	if !hostM.RemoveReceiver(removedID) {
+	if !hostM.RemoveReceiver() {
 		t.Fatal("expected receiver removal to succeed")
 	}
-	if hostM.RemoveReceiver(removedID) {
+	if hostM.RemoveReceiver() {
 		t.Fatal("expected second receiver removal to fail")
 	}
-	if hostM.RemoveReceiver(activeID + "missing") {
-		t.Fatal("expected unknown receiver removal to fail")
+	if err := hostM.OnReceive(func(ctx context.Context, p mJSONPayload) error {
+		_ = ctx
+		active <- p.Name
+		return nil
+	}); err != nil {
+		t.Fatalf("register active receiver: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -365,12 +604,6 @@ func TestMReceiverIDAndRemoval(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for active receiver")
 	}
-	select {
-	case got := <-removed:
-		t.Fatalf("removed receiver was called with %q", got)
-	case <-time.After(100 * time.Millisecond):
-	}
-
 	cancel()
 	if err := <-hostErr; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("host serve error: %v", err)
@@ -380,13 +613,13 @@ func TestMReceiverIDAndRemoval(t *testing.T) {
 	}
 }
 
-func TestMStreamReceiverIDAndRemoval(t *testing.T) {
+func TestMRejectsMultipleReceivers(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()
 	defer c2.Close()
 
 	messenger := vsock.NewMessenger(c1)
-	codec, err := vsock.NewCodec[mJSONPayload](1453)
+	codec, err := vsock.NewCodec[mJSONPayload](1457)
 	if err != nil {
 		t.Fatalf("new codec: %v", err)
 	}
@@ -395,82 +628,20 @@ func TestMStreamReceiverIDAndRemoval(t *testing.T) {
 		t.Fatalf("new wrapper: %v", err)
 	}
 
-	id, err := wrapper.OnReceiveStream(func(context.Context, *vsock.Message) error { return nil })
-	if err != nil {
-		t.Fatalf("register stream receiver: %v", err)
+	if err := wrapper.OnReceive(func(context.Context, mJSONPayload) error { return nil }); err != nil {
+		t.Fatalf("register receiver: %v", err)
 	}
-	if id == "" {
-		t.Fatal("expected stream receiver id")
+	if err := wrapper.OnReceive(func(context.Context, mJSONPayload) error { return nil }); !errors.Is(err, vsock.ErrHandlerAlreadyRegistered) {
+		t.Fatalf("expected ErrHandlerAlreadyRegistered for second receiver, got %v", err)
 	}
-	if !wrapper.RemoveStreamReceiver(id) {
-		t.Fatal("expected stream receiver removal to succeed")
+	if !wrapper.RemoveReceiver() {
+		t.Fatal("expected receiver removal to succeed")
 	}
-	if wrapper.RemoveStreamReceiver(id) {
-		t.Fatal("expected second stream receiver removal to fail")
+	if wrapper.RemoveReceiver() {
+		t.Fatal("expected second receiver removal to fail")
 	}
-}
-
-func TestMReceiversRunInParallel(t *testing.T) {
-	hostConn, clientConn := net.Pipe()
-	defer hostConn.Close()
-	defer clientConn.Close()
-
-	host := vsock.NewMessenger(hostConn)
-	client := vsock.NewMessenger(clientConn)
-
-	codec, err := vsock.NewCodec[mJSONPayload](1457)
-	if err != nil {
-		t.Fatalf("new codec: %v", err)
-	}
-	hostM, err := NewM[mJSONPayload](host, codec)
-	if err != nil {
-		t.Fatalf("new host wrapper: %v", err)
-	}
-	clientM, err := NewM[mJSONPayload](client, codec)
-	if err != nil {
-		t.Fatalf("new client wrapper: %v", err)
-	}
-
-	entered := make(chan struct{}, 2)
-	release := make(chan struct{})
-	for i := 0; i < 2; i++ {
-		if _, err := hostM.OnReceive(func(mJSONPayload) {
-			entered <- struct{}{}
-			<-release
-		}); err != nil {
-			t.Fatalf("register receiver: %v", err)
-		}
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	hostErr := make(chan error, 1)
-	clientErr := make(chan error, 1)
-	go func() { hostErr <- host.Serve(ctx) }()
-	go func() { clientErr <- client.Serve(ctx) }()
-
-	sendErr := make(chan error, 1)
-	go func() { sendErr <- clientM.Send(ctx, mJSONPayload{Name: "parallel"}) }()
-
-	for i := 0; i < 2; i++ {
-		select {
-		case <-entered:
-		case <-time.After(time.Second):
-			close(release)
-			t.Fatal("timeout waiting for receivers to run in parallel")
-		}
-	}
-	close(release)
-	if err := <-sendErr; err != nil {
-		t.Fatalf("send: %v", err)
-	}
-
-	cancel()
-	if err := <-hostErr; err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("host serve error: %v", err)
-	}
-	if err := <-clientErr; err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatalf("client serve error: %v", err)
+	if err := wrapper.OnReceive(func(context.Context, mJSONPayload) error { return nil }); err != nil {
+		t.Fatalf("register receiver after removal: %v", err)
 	}
 }
 
@@ -488,13 +659,10 @@ func TestMRejectsNilHandlers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new message wrapper: %v", err)
 	}
-	if _, err := m.OnReceive(nil); !errors.Is(err, vsock.ErrNilHandler) {
+	if err := m.OnReceive(nil); !errors.Is(err, vsock.ErrNilHandler) {
 		t.Fatalf("expected ErrNilHandler for nil receiver, got %v", err)
 	}
-	if _, err := m.OnReceiveStream(nil); !errors.Is(err, vsock.ErrNilHandler) {
-		t.Fatalf("expected ErrNilHandler for nil stream receiver, got %v", err)
-	}
-	if _, err := (*M[mJSONPayload])(nil).OnReceive(func(mJSONPayload) {}); !errors.Is(err, vsock.ErrNilHandler) {
+	if err := (*M[mJSONPayload])(nil).OnReceive(func(context.Context, mJSONPayload) error { return nil }); !errors.Is(err, vsock.ErrNilHandler) {
 		t.Fatalf("expected ErrNilHandler for nil M, got %v", err)
 	}
 
@@ -515,13 +683,17 @@ func TestMAutoStreamCodecDetectsReaderPayload(t *testing.T) {
 	}
 	wrapper, err := NewM[vsock.ReaderPayload](sender, codec)
 	if err != nil {
-		t.Fatalf("new wrapper: %v", err)
+		t.Fatalf("new sender wrapper: %v", err)
+	}
+	receiverWrapper, err := NewM[vsock.ReaderPayload](receiver, codec)
+	if err != nil {
+		t.Fatalf("new receiver wrapper: %v", err)
 	}
 
 	got := make(chan []byte, 1)
-	if err := receiver.OnReceive(codec.TypeID(), func(ctx context.Context, msg *vsock.Message) error {
+	if err := receiverWrapper.OnReceive(func(ctx context.Context, payload vsock.ReaderPayload) error {
 		_ = ctx
-		b, err := msg.ReadAll()
+		b, err := io.ReadAll(payload.Reader)
 		if err != nil {
 			return err
 		}

@@ -138,11 +138,15 @@ func NewFileTransfer(messenger *vsock.Messenger) (*FileTransfer, error) {
 		incoming: make(map[string]*incomingFileTransfer),
 	}
 
-	open.OnRequest(ft.handleOpen)
-	if _, err := body.OnReceiveStream(ft.handleBody); err != nil {
+	if err := open.OnRequest(ft.handleOpen); err != nil {
 		return nil, err
 	}
-	commit.OnRequest(ft.handleCommit)
+	if err := body.OnReceive(ft.handleBody); err != nil {
+		return nil, err
+	}
+	if err := commit.OnRequest(ft.handleCommit); err != nil {
+		return nil, err
+	}
 
 	return ft, nil
 }
@@ -296,9 +300,9 @@ func (f *FileTransfer) handleOpen(ctx context.Context, req FileTransferRequest) 
 	return resp, nil
 }
 
-func (f *FileTransfer) handleBody(ctx context.Context, msg *vsock.Message) error {
+func (f *FileTransfer) handleBody(ctx context.Context, body fileTransferBody) error {
 	_ = ctx
-	r := msg.Reader()
+	r := body.Reader
 	if r == nil {
 		return vsock.ErrNilMessage
 	}
